@@ -1,13 +1,20 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
 import { ActivityService } from './activity.service';
 import { Action, DcService } from './dc.service';
 import { JobQueueService } from './job-queue.service';
 import { SshPoolService } from './ssh-pool.service';
 
-class EnqueueDto {
+class CreateBatchDto {
   policies: string[];
   action: Action;
+  name?: string;
+  pgPassword?: string;
+}
+
+class RetryDto {
+  /** Specific jobs to retry; omit to retry every connection/server failure in the batch. */
+  jobIds?: string[];
   pgPassword?: string;
 }
 
@@ -26,32 +33,76 @@ export class DcController {
     return this.dc.status();
   }
 
-  /** Cheap snapshot the UI polls: session states/activity, all jobs, and log events after `since`. */
-  @Get('jobs')
-  jobs(@Query('since') since?: string) {
+  /**
+   * Cheap snapshot the UI polls: sessions, batch summaries, the jobs of the batch
+   * being viewed (`batch`), and log events after `since`.
+   */
+  @Get('state')
+  state(@Query('since') since?: string, @Query('batch') batch?: string) {
+    let selected: ReturnType<JobQueueService['get']> | null = null;
+    try {
+      selected = batch ? this.queue.get(batch) : null;
+    } catch {
+      selected = null; // deleted meanwhile
+    }
     return {
       sessions: this.pool.info(),
       pending: this.queue.pending,
-      jobs: this.queue.list(),
+      vmBusy: this.queue.vmBusy,
+      batches: this.queue.summaries(),
+      selected,
       events: this.activity.recent(Number(since) || 0),
       lastSeq: this.activity.lastSeq, // lets the UI notice a server restart (seq goes backwards)
     };
   }
 
-  @Post('jobs')
-  enqueue(@Body() body: EnqueueDto) {
-    return this.queue.enqueue(body.policies, body.action, body.pgPassword);
+  @Post('batches')
+  createBatch(@Body() body: CreateBatchDto) {
+    return this.queue.create(body.policies, body.action, body.name, body.pgPassword);
   }
 
-  @Post('jobs/cancel')
-  cancel() {
-    return { cancelled: this.queue.cancelQueued() };
+  @Get('batches/:id')
+  batch(@Param('id') id: string) {
+    return this.queue.get(id);
   }
 
-  @Delete('jobs')
-  clear() {
-    this.queue.clearFinished();
+  @Patch('batches/:id')
+  rename(@Param('id') id: string, @Body() body: { name: string }) {
+    return this.queue.rename(id, body.name);
+  }
+
+  @Delete('batches/:id')
+  remove(@Param('id') id: string) {
+    this.queue.remove(id);
     return { ok: true };
+  }
+
+  @Post('batches/:id/cancel')
+  cancel(@Param('id') id: string) {
+    return { cancelled: this.queue.cancel(id) };
+  }
+
+  /** Stop one policy (running or queued); `requeue` puts it at the back of the queue. */
+  @Post('batches/:id/jobs/:jobId/stop')
+  stop(@Param('id') id: string, @Param('jobId') jobId: string, @Body() body: { requeue?: boolean }) {
+    return this.queue.stop(id, jobId, !!body?.requeue);
+  }
+
+  @Post('batches/:id/retry')
+  retry(@Param('id') id: string, @Body() body: RetryDto) {
+    return this.queue.retry(id, body.jobIds, body.pgPassword);
+  }
+
+  /** Drop all SSH sessions and log in to the VM again (running policies are re-queued). */
+  @Post('vm/reconnect')
+  async vmReconnect() {
+    return { result: await this.queue.reconnectVm(), sessions: this.pool.info() };
+  }
+
+  /** Close all SSH sessions (only when nothing is running or queued). */
+  @Post('vm/disconnect')
+  vmDisconnect() {
+    return { result: this.queue.disconnectVm(), sessions: this.pool.info() };
   }
 
   /** Retry sessions that failed; per-session state + lastError carry the outcome. */

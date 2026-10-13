@@ -63,6 +63,22 @@ export class SshPoolService implements OnApplicationBootstrap, OnModuleDestroy {
     for (const s of this.sessions) s.close();
   }
 
+  /** Close every session (killing anything running on them). They reopen on demand. */
+  disconnectAll(reason: string, label = 'Disconnected; reconnects when needed') {
+    for (const s of this.sessions) {
+      s.abort(reason);
+      this.activity.set(s.id, 'disconnected', label);
+    }
+    // Next connect goes through #1 first again (fresh login before the others).
+    this.primed = false;
+  }
+
+  /** Log in again on session #1; the others follow lazily when the queue needs them. */
+  async connectFirst(): Promise<void> {
+    await this.sessions[0].connect();
+    this.primed = true;
+  }
+
   /** Retry sessions that are down after a failure (sessions never opened stay lazy). */
   async reconnectFailed(): Promise<void> {
     const targets = this.sessions.filter(

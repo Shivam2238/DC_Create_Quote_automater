@@ -7,6 +7,8 @@ export interface SessionActivity {
   phase: Phase;
   label: string;
   policy?: string;
+  /** Action of the job being run, so the UI can draw its step tracker. */
+  action?: string;
   since: string;
 }
 
@@ -16,6 +18,7 @@ export interface ActivityEvent {
   level: Level;
   session?: number;
   policy?: string;
+  batch?: string;
   msg: string;
 }
 
@@ -32,15 +35,15 @@ export class ActivityService {
   private readonly events: ActivityEvent[] = [];
   private seq = 0;
 
-  set(session: number, phase: Phase, label: string, policy?: string) {
-    this.current.set(session, { phase, label, policy, since: new Date().toISOString() });
+  set(session: number, phase: Phase, label: string, policy?: string, action?: string) {
+    this.current.set(session, { phase, label, policy, action, since: new Date().toISOString() });
   }
 
   get(session: number): SessionActivity {
     return this.current.get(session) ?? { phase: 'disconnected', label: 'Not opened yet', since: new Date().toISOString() };
   }
 
-  log(msg: string, opts: { level?: Level; session?: number; policy?: string } = {}) {
+  log(msg: string, opts: { level?: Level; session?: number; policy?: string; batch?: string } = {}) {
     this.events.push({ ...opts, seq: ++this.seq, at: new Date().toISOString(), level: opts.level ?? 'info', msg });
     if (this.events.length > MAX_EVENTS) this.events.splice(0, this.events.length - MAX_EVENTS);
   }

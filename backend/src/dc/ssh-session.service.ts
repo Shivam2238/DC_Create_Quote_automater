@@ -12,11 +12,15 @@ export interface ExecResult {
   stderr: string;
 }
 
-/** The session died. `started` = the job's BEGIN marker had come back, i.e. it may have run. */
+/** Why a session ended: it died, a job hit the timeout, or someone stopped the job. */
+export type EndCause = 'lost' | 'timeout' | 'aborted';
+
+/** The session ended under a job. `started` = the job's BEGIN marker had come back, i.e. it may have run. */
 export class SessionLostError extends Error {
   constructor(
     message: string,
     readonly started: boolean,
+    readonly endCause: EndCause = 'lost',
   ) {
     super(message);
   }
@@ -97,6 +101,11 @@ export class SshSession {
     this.activity.log(msg, { level, session: this.id });
   }
 
+  /** Kill whatever is running (used by "Stop"); the session reconnects on its next job. */
+  abort(reason: string) {
+    if (this.child) this.drop(this.child, reason, 'aborted');
+  }
+
   close() {
     this.shuttingDown = true;
     if (this.child) this.drop(this.child, 'server shutting down');
@@ -167,7 +176,9 @@ export class SshSession {
     child.stderr.on('data', (d: string) => this.onStderr(d));
     child.stdin.on('error', () => undefined); // EPIPE when the process dies; handled on 'close'
     child.on('error', (e) => this.onClose(child, `failed to start ${file}: ${e.message}`));
-    child.on('close', (code) => this.onClose(child, `session exited (code ${code})`));
+    child.on('close', (code, signal) =>
+      this.onClose(child, code === null ? `session was killed (${signal ?? 'signal'})` : `session exited (code ${code})`),
+    );
 
     // Round-trip a no-op: proves ssh is up, sudo works and the shell is reading stdin.
     const connectTimeout = (Number(this.config.get('DC_CONNECT_TIMEOUT_SECONDS')) || 90) * 1000;
@@ -194,8 +205,8 @@ export class SshSession {
   }
 
   /** Mark the session dead now (don't wait for pipes to close) and kill its process group. */
-  private drop(child: ChildProcessWithoutNullStreams, reason: string) {
-    this.onClose(child, reason);
+  private drop(child: ChildProcessWithoutNullStreams, reason: string, cause: EndCause = 'lost') {
+    this.onClose(child, reason, cause);
     try {
       process.kill(-child.pid!, 'SIGKILL');
     } catch {
@@ -203,21 +214,29 @@ export class SshSession {
     }
   }
 
-  private onClose(child: ChildProcessWithoutNullStreams, reason: string) {
+  private onClose(child: ChildProcessWithoutNullStreams, reason: string, cause: EndCause = 'lost') {
     if (this.child !== child) return; // already dropped / replaced
-    const detail = this.stderrTail.trim().split('\n').slice(-5).join('\n');
     this.child = undefined;
     this.state = 'disconnected';
     this.connectedAt = undefined;
     if (!this.shuttingDown) {
-      this.lastError = detail ? `${reason}: ${detail}` : reason;
-      this.logger.warn(this.lastError);
-      this.activity.set(this.id, 'disconnected', 'Disconnected; reconnects on its next job');
-      this.log(`Session closed: ${reason}`, 'error');
+      if (cause === 'lost') {
+        // gcloud/ssh stderr explains real disconnects; it's just noise for timeouts/stops.
+        const detail = this.stderrTail.trim().split('\n').slice(-5).join('\n');
+        this.lastError = detail ? `${reason}: ${detail}` : reason;
+        this.logger.warn(this.lastError);
+        this.activity.set(this.id, 'disconnected', 'Disconnected; reconnects on its next job');
+        this.log(`Session closed: ${reason}`, 'error');
+      } else {
+        // We ended it on purpose: not a fault, so no "session down" banner.
+        this.lastError = '';
+        this.activity.set(this.id, 'disconnected', 'Restarting; reconnects on its next job');
+        this.log(`Session restarted: ${reason}`, 'warn');
+      }
     }
     if (this.pending) {
       clearTimeout(this.pending.timer);
-      this.pending.reject(new SessionLostError(this.lastError || reason, this.pending.started));
+      this.pending.reject(new SessionLostError(reason, this.pending.started, cause));
       this.pending = undefined;
     }
   }
@@ -255,7 +274,7 @@ export class SshSession {
     } catch (e) {
       // Session was already dead when we wrote (e.g. network drop not yet noticed) and
       // the job never started: safe to replay once on a fresh session.
-      if (!(e instanceof SessionLostError) || e.started) throw e;
+      if (!(e instanceof SessionLostError) || e.started || e.endCause === 'aborted') throw e;
       this.logger.warn(`session lost before job started (${e.message}); reconnecting and retrying`);
       this.log('Session was lost before the job started; reconnecting and retrying once', 'warn');
       await this.connect();
@@ -286,7 +305,7 @@ export class SshSession {
       const timer = setTimeout(() => {
         // Can't interrupt one command in the remote shell reliably; recycle the session.
         // drop() rejects this pending job; the next job reconnects.
-        this.drop(child, `job timed out after ${timeoutMs / 1000}s, session will reconnect`);
+        this.drop(child, `no response within ${timeoutMs / 1000}s`, 'timeout');
       }, timeoutMs);
       this.pending = { id, started: false, onMarker, scanPos: this.buffer.length, resolve, reject, timer };
       child.stdin.write(framed);

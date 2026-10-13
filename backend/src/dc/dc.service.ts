@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { Level, Phase } from './activity.service';
-import { API_LOGS_TABLE, RemoteRunnerService } from './remote-runner.service';
+import { HTTP_MARKER, RemoteRunnerService } from './remote-runner.service';
 import { SshPoolService } from './ssh-pool.service';
 import { SshSession, spawnOnce } from './ssh-session.service';
 
@@ -16,15 +16,38 @@ export interface QuoteResult {
   premium?: string;
   isPremiumMatched?: string;
   cohortType?: string;
+  /** HTTP status of the create-quote call, when curl got that far. */
+  httpStatus?: number;
   raw: unknown;
 }
 
 export interface PayloadResult {
   kind: PayloadKind;
   status: 'saved' | 'null' | 'not-json';
+  /** File name in the payloads dir (served by GET /api/files/:name). */
   file?: string;
-  content?: unknown;
+  size?: number;
 }
+
+/**
+ * Why a policy failed:
+ * - connection: our side (SSH session, network, timeout). Usually fine to retry.
+ * - server:     the create-quote service/gateway failed (5xx, non-JSON). Retry may work.
+ * - api:        the API/data said no (is_success false, no api_logs row). Retrying won't help.
+ * - input:      something we were given is wrong (e.g. Postgres password).
+ * - stopped:    stopped by the user from the UI.
+ */
+export type FailureKind = 'connection' | 'server' | 'api' | 'input' | 'stopped';
+
+export interface Failure {
+  kind: FailureKind;
+  reason: string;
+  step: 'connect' | 'quote' | 'payload';
+  /** The create-quote request may have reached the API, so a retry could create a second quote. */
+  mayHaveRun: boolean;
+}
+
+export const RETRYABLE: FailureKind[] = ['connection', 'server'];
 
 /** Step reporting for the live activity view. `phase` updates the session card; every call is logged. */
 export type Progress = (msg: string, opts?: { phase?: Phase; level?: Level }) => void;
@@ -33,7 +56,11 @@ export interface RunResult {
   policy: string;
   quote?: QuoteResult;
   payloads?: PayloadResult[];
-  message?: string;
+}
+
+export interface RunOutcome {
+  result: RunResult;
+  failure?: Failure;
 }
 
 /** Columns hold JSON as text, sometimes double-encoded: unwrap until it's not a string. */
@@ -46,6 +73,41 @@ function deepJson(value: unknown): unknown {
     }
   }
   return value;
+}
+
+// curl exit codes: https://curl.se/libcurl/c/libcurl-errors.html
+const CURL_NOT_SENT = new Set([5, 6, 7, 35, 60]); // proxy/DNS/connect/TLS: request never reached the API
+const CURL_MAYBE_SENT = new Set([18, 28, 52, 55, 56, 92]); // timeout/empty reply/send-recv errors mid-request
+
+/** Classify a failed remote step from the job's exit code and stderr. */
+function classifyRemote(step: 'quote' | 'payload', code: number, stderr: string): Failure {
+  const text = stderr.trim().split('\n').slice(-3).join(' ') || `exit code ${code}`;
+  if (step === 'quote') {
+    const m = stderr.match(/curl: \((\d+)\)/);
+    const curlCode = m ? Number(m[1]) : code;
+    if (CURL_NOT_SENT.has(curlCode)) {
+      return { kind: 'connection', step, mayHaveRun: false, reason: `Could not reach the create-quote API: ${text}` };
+    }
+    return {
+      kind: 'connection',
+      step,
+      mayHaveRun: CURL_MAYBE_SENT.has(curlCode) || !m,
+      reason: `Connection to the create-quote API broke: ${text}`,
+    };
+  }
+  if (/password authentication failed/i.test(stderr)) {
+    return { kind: 'input', step, mayHaveRun: false, reason: 'Postgres password is wrong' };
+  }
+  if (/could not connect|connection refused|timeout expired|server closed the connection|no route to host|SSL/i.test(stderr)) {
+    return { kind: 'connection', step, mayHaveRun: false, reason: `Could not reach Postgres: ${text}` };
+  }
+  return { kind: 'connection', step, mayHaveRun: false, reason: `Postgres query failed: ${text}` };
+}
+
+function apiMessage(resp: any): string {
+  const msg = resp?.message ?? resp?.error ?? resp?.data?.message ?? resp?.errors;
+  if (msg) return typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 300);
+  return JSON.stringify(resp).slice(0, 300);
 }
 
 @Injectable()
@@ -65,13 +127,18 @@ export class DcService {
     return !!this.config.get('DC_PG_PASSWORD');
   }
 
+  /**
+   * Runs one policy on the given session. Policy-level failures come back as
+   * `failure` (with whatever succeeded before it in `result`); only session-level
+   * problems (connect failure, session lost, timeout) are thrown.
+   */
   async run(
     policy: string,
     action: Action,
     session: SshSession,
     pgPassword?: string,
     progress: Progress = () => undefined,
-  ): Promise<RunResult> {
+  ): Promise<RunOutcome> {
     if (!/^\d+$/.test(policy ?? '')) throw new BadRequestException('policy number must be digits only');
     if (!['quote', 'payloads', 'all'].includes(action)) throw new BadRequestException('invalid action');
 
@@ -80,43 +147,85 @@ export class DcService {
     const password = pgPassword || this.config.get<string>('DC_PG_PASSWORD');
     if (wantPayloads && !password) throw new BadRequestException('postgres password required');
 
-    const sections = await this.runner.run(
+    const seen = new Set<string>();
+    const out = await this.runner.run(
       this.runner.buildScript(policy, wantQuote, wantPayloads, password),
       session,
       (edge, tag) => {
+        seen.add(`${edge}_${tag}`);
         if (tag === 'QUOTE' && edge === 'BEGIN') progress('Calling create-quote API (curl)…', { phase: 'quote' });
         if (tag === 'QUOTE' && edge === 'END') progress('create-quote API responded');
-        if (tag === 'PAYLOAD' && edge === 'BEGIN') progress(`Querying ${API_LOGS_TABLE()} in Postgres (psql)…`, { phase: 'payload' });
+        if (tag === 'PAYLOAD' && edge === 'BEGIN') progress(`Querying ${this.runner.apiLogsTable} in Postgres (psql)…`, { phase: 'payload' });
         if (tag === 'PAYLOAD' && edge === 'END') progress('Postgres query returned');
       },
     );
 
     const result: RunResult = { policy };
-    if (wantQuote) {
-      const q = (result.quote = this.parseQuote(sections.quote ?? ''));
-      if (q.success) progress(`Quote ${q.quoteNumber} created (premium ${q.premium}, matched ${q.isPremiumMatched === '1' ? 'yes' : 'no'})`, { level: 'success' });
-      else progress('create-quote did not return a quote number', { level: 'warn' });
-    }
-    if (wantPayloads) {
-      if (sections.payload) {
-        progress('Parsing and saving payload files…', { phase: 'saving' });
-        result.payloads = await this.savePayloads(policy, sections.payload);
-        const saved = result.payloads.map((p) => `${p.kind}: ${p.status}`).join(', ');
-        progress(`Payloads ${saved}`, { level: result.payloads.some((p) => p.status !== 'saved') ? 'warn' : 'success' });
+    let failure: Failure | undefined;
+
+    if (wantQuote && out.quote !== undefined) {
+      const q = (result.quote = this.parseQuote(out.quote));
+      if (q.success) {
+        progress(`Quote ${q.quoteNumber} created (premium ${q.premium}, matched ${q.isPremiumMatched === '1' ? 'yes' : 'no'})`, {
+          level: 'success',
+        });
       } else {
-        result.message = `no rows in ${API_LOGS_TABLE()}`;
-        progress(result.message, { level: 'warn' });
+        failure = this.classifyQuote(q);
+        progress(`create-quote failed: ${failure.reason}`, { level: 'warn' });
       }
     }
-    return result;
+
+    if (out.code !== 0) {
+      // The script stopped at the step that failed (set -e).
+      const step = seen.has('BEGIN_PAYLOAD') && !seen.has('END_PAYLOAD') ? 'payload' : 'quote';
+      failure ??= classifyRemote(step, out.code, out.stderr);
+      progress(failure.reason, { level: 'error' });
+      return { result, failure };
+    }
+
+    if (wantPayloads && out.payload !== undefined) {
+      progress('Parsing and saving payload files…', { phase: 'saving' });
+      result.payloads = await this.savePayloads(policy, out.payload);
+      const missing = result.payloads.filter((p) => p.status === 'null').map((p) => p.kind);
+      if (missing.length === 2) {
+        failure ??= { kind: 'api', step: 'payload', mayHaveRun: false, reason: `No ${this.runner.apiLogsTable} row for this policy` };
+      } else if (missing.length) {
+        failure ??= { kind: 'api', step: 'payload', mayHaveRun: false, reason: `external_${missing[0]} is NULL in ${this.runner.apiLogsTable}` };
+      }
+      const saved = result.payloads.map((p) => `${p.kind}: ${p.status}`).join(', ');
+      progress(`Payloads ${saved}`, { level: missing.length ? 'warn' : 'success' });
+    }
+    return { result, failure };
+  }
+
+  private classifyQuote(q: QuoteResult): Failure {
+    const status = q.httpStatus ?? 0;
+    if (status >= 500 || status === 0 || typeof q.raw === 'string') {
+      const what = status ? `HTTP ${status}` : 'no HTTP status';
+      const body = typeof q.raw === 'string' ? q.raw.slice(0, 200) : apiMessage(q.raw);
+      return {
+        kind: 'server',
+        step: 'quote',
+        // A gateway timeout/5xx can happen after the wrapper already created the quote.
+        mayHaveRun: true,
+        reason: `create-quote service error (${what}): ${body}`,
+      };
+    }
+    return { kind: 'api', step: 'quote', mayHaveRun: true, reason: `API rejected (HTTP ${status}): ${apiMessage(q.raw)}` };
   }
 
   private parseQuote(raw: string): QuoteResult {
+    let httpStatus: number | undefined;
+    const i = raw.lastIndexOf(HTTP_MARKER);
+    if (i >= 0) {
+      httpStatus = Number(raw.slice(i + HTTP_MARKER.length).trim()) || undefined;
+      raw = raw.slice(0, i).trim();
+    }
     let resp: any;
     try {
       resp = JSON.parse(raw);
     } catch {
-      return { success: false, raw };
+      return { success: false, httpStatus, raw };
     }
     const data = resp?.data ?? {};
     return {
@@ -125,6 +234,7 @@ export class DcService {
       premium: data.premium,
       isPremiumMatched: data.is_premium_matched,
       cohortType: data.cohort_type,
+      httpStatus,
       raw: resp,
     };
   }
@@ -138,14 +248,12 @@ export class DcService {
       const value = deepJson(row[kind]);
       if (value === null || value === undefined) {
         results.push({ kind, status: 'null' });
-      } else if (typeof value === 'string') {
-        const file = path.join(this.outDir, `${policy}_${kind}_payload.txt`);
-        await fs.writeFile(file, value);
-        results.push({ kind, status: 'not-json', file, content: value });
       } else {
-        const file = path.join(this.outDir, `${policy}_${kind}_payload.json`);
-        await fs.writeFile(file, JSON.stringify(value, null, 2) + '\n');
-        results.push({ kind, status: 'saved', file, content: value });
+        const isJson = typeof value !== 'string';
+        const file = `${policy}_${kind}_payload.${isJson ? 'json' : 'txt'}`;
+        const text = isJson ? JSON.stringify(value, null, 2) + '\n' : (value as string);
+        await fs.writeFile(path.join(this.outDir, file), text);
+        results.push({ kind, status: isJson ? 'saved' : 'not-json', file, size: Buffer.byteLength(text) });
       }
     }
     return results;

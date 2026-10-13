@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import type { Action, ActivityEvent, Job, Phase, SessionInfo } from './api'
+import { useLayoutEffect, useRef, useState } from 'react'
+import type { Action, ActivityEvent, Phase, SessionInfo } from './api'
+import { useNow } from './ui'
 
 const STEPS: Record<Action, { phase: Phase; label: string }[]> = {
   quote: [
@@ -36,24 +37,14 @@ function elapsed(since: string, now: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
-/** Re-render every `ms` so timers tick between polls. */
-function useNow(ms: number): number {
-  const [now, setNow] = useState(Date.now())
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), ms)
-    return () => clearInterval(t)
-  }, [ms])
-  return now
-}
-
-export function SessionCards({ sessions, jobs }: { sessions: SessionInfo[]; jobs: Job[] }) {
+export function SessionCards({ sessions }: { sessions: SessionInfo[] }) {
   const now = useNow(250)
   return (
     <div className="sessions">
       {sessions.map((s) => {
         const a = s.activity
-        const job = jobs.find((j) => j.state === 'running' && j.session === s.id)
-        const steps = job ? STEPS[job.action] : []
+        const busy = PHASE_CLASS[a.phase] === 'busy'
+        const steps = busy && a.action ? STEPS[a.action] : []
         const current = steps.findIndex((st) => st.phase === a.phase)
         return (
           <div key={s.id} className={`session ${PHASE_CLASS[a.phase]}`}>
@@ -86,11 +77,25 @@ export function SessionCards({ sessions, jobs }: { sessions: SessionInfo[]; jobs
   )
 }
 
-export function ActivityLog({ events, sessions }: { events: ActivityEvent[]; sessions: SessionInfo[] }) {
-  const [filter, setFilter] = useState<number | 'all'>('all')
+export function ActivityLog({
+  events,
+  sessions,
+  batchId,
+}: {
+  events: ActivityEvent[]
+  sessions: SessionInfo[]
+  /** Selected batch, for the "This batch" filter. */
+  batchId?: string
+}) {
+  const [filter, setFilter] = useState<number | 'all' | 'batch'>('all')
   const boxRef = useRef<HTMLDivElement>(null)
   const stickToBottom = useRef(true)
-  const shown = filter === 'all' ? events : events.filter((e) => e.session === filter)
+  const shown =
+    filter === 'all'
+      ? events
+      : filter === 'batch'
+        ? events.filter((e) => e.batch && e.batch === batchId)
+        : events.filter((e) => e.session === filter)
 
   // Follow new lines like a terminal, unless the user has scrolled up to read.
   useLayoutEffect(() => {
@@ -103,7 +108,7 @@ export function ActivityLog({ events, sessions }: { events: ActivityEvent[]; ses
       <div className="card-head">
         <h2>Activity log</h2>
         <div className="segmented small-seg" role="radiogroup" aria-label="Filter by session">
-          {(['all', ...sessions.map((s) => s.id)] as const).map((f) => (
+          {(['all', ...(batchId ? (['batch'] as const) : []), ...sessions.map((s) => s.id)] as const).map((f) => (
             <button
               key={f}
               role="radio"
@@ -111,7 +116,7 @@ export function ActivityLog({ events, sessions }: { events: ActivityEvent[]; ses
               className={filter === f ? 'on' : ''}
               onClick={() => setFilter(f)}
             >
-              {f === 'all' ? 'All' : `#${f}`}
+              {f === 'all' ? 'All' : f === 'batch' ? 'This batch' : `#${f}`}
             </button>
           ))}
         </div>

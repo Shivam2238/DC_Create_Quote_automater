@@ -7,6 +7,7 @@ export interface QuoteResult {
   premium?: string
   isPremiumMatched?: string
   cohortType?: string
+  httpStatus?: number
   raw: unknown
 }
 
@@ -14,31 +15,79 @@ export interface PayloadResult {
   kind: PayloadKind
   status: 'saved' | 'null' | 'not-json'
   file?: string
-  content?: unknown
+  size?: number
 }
 
 export interface RunResult {
   policy: string
   quote?: QuoteResult
   payloads?: PayloadResult[]
-  message?: string
 }
 
-export type JobState = 'queued' | 'running' | 'done' | 'error'
+/**
+ * connection: our side (SSH, network, timeout), retry recommended
+ * server:     create-quote service/gateway error (5xx), retry may work
+ * api:        the API/data said no; retrying won't help
+ * input:      something we supplied is wrong (e.g. Postgres password)
+ */
+export type FailureKind = 'connection' | 'server' | 'api' | 'input' | 'stopped'
+export const RETRYABLE: FailureKind[] = ['connection', 'server']
+
+export interface Failure {
+  kind: FailureKind
+  reason: string
+  step: 'connect' | 'quote' | 'payload'
+  mayHaveRun: boolean
+}
+
+export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface Attempt {
+  attempt: number
+  action: Action
+  session?: number
+  finishedAt: string
+  failure: Failure
+}
 
 export interface Job {
   id: string
   batchId: string
   policy: string
   action: Action
+  runAction: Action
   state: JobState
+  attempts: number
   createdAt: string
   startedAt?: string
   finishedAt?: string
-  /** Which pooled SSH session ran it. */
   session?: number
   result?: RunResult
-  error?: string
+  failure?: Failure
+  history: Attempt[]
+}
+
+export type BatchStatus = 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface BatchSummary {
+  id: string
+  name: string
+  action: Action
+  createdAt: string
+  finishedAt?: string
+  status: BatchStatus
+  total: number
+  succeeded: number
+  failed: number
+  retryable: number
+  running: number
+  queued: number
+  cancelled: number
+}
+
+export interface BatchDetail {
+  summary: BatchSummary
+  jobs: Job[]
 }
 
 export type Phase = 'disconnected' | 'connecting' | 'idle' | 'starting' | 'quote' | 'payload' | 'saving'
@@ -48,7 +97,16 @@ export interface SessionActivity {
   phase: Phase
   label: string
   policy?: string
+  action?: Action
   since: string
+}
+
+export interface SessionInfo {
+  id: number
+  state: 'disconnected' | 'connecting' | 'connected'
+  lastError: string
+  connectedAt?: string
+  activity: SessionActivity
 }
 
 export interface ActivityEvent {
@@ -57,21 +115,16 @@ export interface ActivityEvent {
   level: Level
   session?: number
   policy?: string
+  batch?: string
   msg: string
 }
 
-export interface SessionInfo {
-  id: number
-  activity: SessionActivity
-  state: 'disconnected' | 'connecting' | 'connected'
-  lastError: string
-  connectedAt?: string
-}
-
-export interface JobsSnapshot {
+export interface AppState {
   sessions: SessionInfo[]
   pending: number
-  jobs: Job[]
+  vmBusy: '' | 'reconnecting' | 'disconnecting'
+  batches: BatchSummary[]
+  selected: BatchDetail | null
   events: ActivityEvent[]
   lastSeq: number
 }
@@ -84,30 +137,41 @@ export interface Status {
   outDir: string
 }
 
-export interface SavedFile {
-  name: string
-  size: number
-  modified: string
-}
-
 async function json<T>(res: Response): Promise<T> {
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body?.message ?? `HTTP ${res.status}`)
   return body as T
 }
 
+const send = (method: string, url: string, body?: unknown) =>
+  fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+
 export const api = {
   status: () => fetch('/api/status').then((r) => json<Status>(r)),
-  files: () => fetch('/api/files').then((r) => json<SavedFile[]>(r)),
+  state: (since: number, batch?: string) =>
+    fetch(`/api/state?since=${since}${batch ? `&batch=${encodeURIComponent(batch)}` : ''}`).then((r) => json<AppState>(r)),
+  createBatch: (policies: string[], action: Action, name?: string, pgPassword?: string) =>
+    send('POST', '/api/batches', { policies, action, name: name || undefined, pgPassword: pgPassword || undefined }).then((r) =>
+      json<BatchDetail>(r),
+    ),
+  rename: (id: string, name: string) => send('PATCH', `/api/batches/${id}`, { name }).then((r) => json<BatchSummary>(r)),
+  remove: (id: string) => send('DELETE', `/api/batches/${id}`).then((r) => json<{ ok: boolean }>(r)),
+  cancel: (id: string) => send('POST', `/api/batches/${id}/cancel`).then((r) => json<{ cancelled: number }>(r)),
+  retry: (id: string, jobIds?: string[], pgPassword?: string) =>
+    send('POST', `/api/batches/${id}/retry`, { jobIds, pgPassword: pgPassword || undefined }).then((r) => json<BatchDetail>(r)),
+  stop: (id: string, jobId: string, requeue: boolean) =>
+    send('POST', `/api/batches/${id}/jobs/${jobId}/stop`, { requeue }).then((r) => json<BatchDetail>(r)),
+  vmReconnect: () => send('POST', '/api/vm/reconnect').then((r) => json<{ result: string; sessions: SessionInfo[] }>(r)),
+  vmDisconnect: () => send('POST', '/api/vm/disconnect').then((r) => json<{ result: string; sessions: SessionInfo[] }>(r)),
+  reconnect: () => send('POST', '/api/session/reconnect').then((r) => json<SessionInfo[]>(r)),
   fileUrl: (name: string) => `/api/files/${encodeURIComponent(name)}`,
-  jobs: (since = 0) => fetch(`/api/jobs?since=${since}`).then((r) => json<JobsSnapshot>(r)),
-  enqueue: (policies: string[], action: Action, pgPassword?: string) =>
-    fetch('/api/jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ policies, action, pgPassword: pgPassword || undefined }),
-    }).then((r) => json<Job[]>(r)),
-  cancelQueued: () => fetch('/api/jobs/cancel', { method: 'POST' }).then((r) => json<{ cancelled: number }>(r)),
-  clearFinished: () => fetch('/api/jobs', { method: 'DELETE' }).then((r) => json<{ ok: boolean }>(r)),
-  reconnect: () => fetch('/api/session/reconnect', { method: 'POST' }).then((r) => json<SessionInfo[]>(r)),
+  fileText: (name: string) =>
+    fetch(`/api/files/${encodeURIComponent(name)}`).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.text()
+    }),
 }

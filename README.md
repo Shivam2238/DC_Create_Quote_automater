@@ -44,15 +44,35 @@ npm run build && npm start     # http://localhost:3000
 | `DC_SESSIONS` | Parallel SSH sessions / workers (default 4, max 8) |
 | `DC_TIMEOUT_SECONDS` | Per-job timeout (default 180); when it's hit, the session is restarted |
 | `DC_CONNECT_TIMEOUT_SECONDS` | Time allowed to open the SSH session (default 90) |
+| `DC_WORK_DIR`, `DC_CREATE_QUOTE_URL`, `DC_PG_CONN`, `DC_API_LOGS_TABLE` | **Required.** VM directory, wrapper URL, psql connection string, api_logs table (see `.env.example`) |
 | `DC_LOCAL=true` | Server is running on the VM itself, so SSH is skipped |
+
+## Batches
+
+Each submission is a **batch**. Its default name is the date and time; you can rename it in the UI. Every batch has a
+report: succeeded and failed counts, each policy's result, and a CSV download. Each failure is classified:
+
+| Kind | Meaning | Retry? |
+| --- | --- | --- |
+| `connection` | Our side: SSH/IAP drop, timeout, curl couldn't connect, Postgres unreachable | Yes, retry is suggested |
+| `server` | create-quote gateway/service error (5xx, non-JSON) | Yes, but it may already have created a quote |
+| `api` | The API rejected the policy, or there's no `api_logs` row | No, fix the data first |
+| `input` | Wrong Postgres password, etc. | After fixing the input |
+
+A retry stays in the same batch, and each policy keeps a history of its attempts. If a **Both** job already created its
+quote and only the payload step failed, the retry only re-fetches the payloads (no second quote). Batches persist in
+`data/batches.json` (`DC_DATA_DIR`). Jobs that were running when the server stopped come back as retryable
+`connection` failures.
 
 ## API
 
 - `GET /api/status` – gcloud auth state, VM config
-- `POST /api/jobs` `{ policies: string[], action: "quote" | "payloads" | "all", pgPassword? }` – adds the policies to the queue
-- `GET /api/jobs` – session state, pending count and all jobs with their results (the UI polls this)
-- `POST /api/jobs/cancel` – drop queued jobs · `DELETE /api/jobs` – clear finished jobs
-- `POST /api/session/reconnect` – restart the SSH session
-- `GET /api/files`, `GET /api/files/:name` – list and download saved payloads
+- `GET /api/state?since=<seq>&batch=<id>` – sessions, batch summaries, the selected batch's jobs, and new log events (the UI polls this)
+- `POST /api/batches` `{ policies, action: "quote" | "payloads" | "all", name?, pgPassword? }` – start a batch
+- `GET /api/batches/:id`, `PATCH /api/batches/:id` `{ name }`, `DELETE /api/batches/:id`
+- `POST /api/batches/:id/retry` `{ jobIds?, pgPassword? }` – without `jobIds`, retries every connection/server failure
+- `POST /api/batches/:id/cancel` – cancel the batch's queued policies
+- `POST /api/session/reconnect` – retry SSH sessions that failed
+- `GET /api/files/:name` – a saved payload file
 
 The server listens on `127.0.0.1` only, because it runs commands as root on the UAT VM. The script is sent over SSH stdin, so the DB password never appears in process args.
