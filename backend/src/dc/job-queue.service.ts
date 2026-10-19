@@ -11,7 +11,8 @@ import { randomUUID } from 'crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { ActivityService, Phase } from './activity.service';
-import { Action, DcService, Failure, RETRYABLE, RunResult } from './dc.service';
+import { Action, DcService, Failure, isTransient, PayloadResult, RETRYABLE, RunResult } from './dc.service';
+import { SettingsService } from './settings.service';
 import { SshPoolService } from './ssh-pool.service';
 import { SessionLostError, spawnOnce } from './ssh-session.service';
 
@@ -43,6 +44,22 @@ export interface Job {
   failure?: Failure;
   /** Earlier failed attempts, oldest first. */
   history: Attempt[];
+  /** Automatic retries used so far (transient API errors). */
+  autoRetries?: number;
+  /** Queued for an automatic retry that starts at this time. */
+  retryAt?: string;
+  /** On-demand lookup of this policy's latest api_logs row (doesn't change the job's result). */
+  dbLogs?: DbLogs;
+}
+
+export interface DbLogs {
+  state: 'queued' | 'running' | 'done' | 'error';
+  requestedAt: string;
+  fetchedAt?: string;
+  payloads?: PayloadResult[];
+  /** Error text found in DuckCreek's external_response. */
+  summary?: string;
+  error?: string;
 }
 
 export interface Batch {
@@ -110,6 +127,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     private readonly pool: SshPoolService,
     private readonly config: ConfigService,
     private readonly activity: ActivityService,
+    private readonly settings: SettingsService,
   ) {}
 
   // ---------------------------------------------------------------- persistence
@@ -132,6 +150,11 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     // Anything unfinished when the server stopped can't resume (passwords aren't stored).
     const now = new Date().toISOString();
     for (const b of this.batches) {
+      for (const j of b.jobs) {
+        if (j.dbLogs && (j.dbLogs.state === 'queued' || j.dbLogs.state === 'running')) {
+          j.dbLogs = { ...j.dbLogs, state: 'error', error: 'The console server restarted before the lookup finished' };
+        }
+      }
       for (const j of b.jobs.filter(isActive)) {
         const wasRunning = j.state === 'running';
         j.state = 'failed';
@@ -174,7 +197,82 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
   // ---------------------------------------------------------------- queries
 
   get pending(): number {
-    return this.queue.length + this.busySessions.size;
+    return this.queue.length + this.busySessions.size + this.delayed.size + this.lookups.length;
+  }
+
+  /** DB-response lookups waiting for a free session; served before queued jobs. */
+  private lookups: { job: Job; password?: string }[] = [];
+
+  /**
+   * Fetch the latest external_request/external_response from api_logs for failed
+   * policies, without calling create-quote again. No `jobIds` = every failed policy.
+   */
+  fetchDbLogs(batchId: string, jobIds?: string[], pgPassword?: string) {
+    const b = this.find(batchId);
+    const targets = (jobIds?.length ? b.jobs.filter((j) => jobIds.includes(j.id)) : b.jobs.filter((j) => j.state === 'failed')).filter(
+      (j) => j.state !== 'running' && j.dbLogs?.state !== 'queued' && j.dbLogs?.state !== 'running',
+    );
+    if (!targets.length) throw new BadRequestException('nothing to look up');
+    this.requirePassword('payloads', pgPassword);
+    const now = new Date().toISOString();
+    for (const job of targets) {
+      job.dbLogs = { state: 'queued', requestedAt: now };
+      this.lookups.push({ job, password: pgPassword });
+    }
+    this.activity.log(`Fetching DB responses for ${targets.length} polic${targets.length === 1 ? 'y' : 'ies'} in "${b.name}"`, {
+      batch: b.id,
+    });
+    this.save();
+    this.dispatch();
+    return this.get(b.id);
+  }
+
+  private async lookup(job: Job, password: string | undefined, index: number) {
+    const session = this.pool.sessions[index];
+    const ctx = { session: session.id, policy: job.policy, batch: job.batchId };
+    job.dbLogs = { ...job.dbLogs!, state: 'running' };
+    this.activity.set(session.id, 'payload', 'Fetching DB response (api_logs)…', job.policy, 'payloads');
+    this.activity.log('Fetching DB response from api_logs…', ctx);
+    try {
+      const { result, failure } = await this.dc.run(job.policy, 'payloads', session, password, (msg, opts = {}) => {
+        if (opts.phase) this.activity.set(session.id, opts.phase, msg, job.policy, 'payloads');
+      });
+      const summary = await this.dc.externalSummary(result.payloads);
+      job.dbLogs = {
+        ...job.dbLogs!,
+        state: failure ? 'error' : 'done',
+        fetchedAt: new Date().toISOString(),
+        payloads: result.payloads,
+        summary,
+        error: failure?.reason,
+      };
+      this.activity.log(failure ? `DB response: ${failure.reason}` : `DB response: ${summary ?? 'no error text found in external_response'}`, {
+        ...ctx,
+        level: failure ? 'error' : summary ? 'warn' : 'info',
+      });
+    } catch (e) {
+      job.dbLogs = { ...job.dbLogs!, state: 'error', fetchedAt: new Date().toISOString(), error: (e as Error).message };
+      this.activity.log(`DB response lookup failed: ${(e as Error).message}`, { ...ctx, level: 'error' });
+    }
+    if (session.state === 'connected') this.activity.set(session.id, 'idle', 'Idle, waiting for jobs');
+    this.save();
+  }
+
+  /** Jobs waiting out an auto-retry backoff (not yet back in the queue). */
+  private readonly delayed = new Set<Job>();
+
+  setSettings(patch: { concurrency?: number; autoRetries?: number }) {
+    const before = this.settings.get();
+    const next = this.settings.update(patch);
+    if (next.concurrency !== before.concurrency) {
+      this.activity.log(`Concurrency changed: ${before.concurrency} → ${next.concurrency} parallel sessions`, { level: 'warn' });
+      this.pool.trimExcess(this.busySessions);
+      this.dispatch();
+    }
+    if (next.autoRetries !== before.autoRetries) {
+      this.activity.log(`Auto-retry for transient API errors: ${before.autoRetries} → ${next.autoRetries}`, { level: 'warn' });
+    }
+    return next;
   }
 
   summaries(): BatchSummary[] {
@@ -281,6 +379,8 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     for (const j of queued) {
       j.state = 'cancelled';
       j.finishedAt = now;
+      j.retryAt = undefined;
+      this.delayed.delete(j);
       this.passwords.delete(j.id);
     }
     this.queue = this.queue.filter((j) => j.state === 'queued');
@@ -306,6 +406,9 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     if (!job) throw new NotFoundException('policy not found in this batch');
 
     if (job.state === 'queued') {
+      // Waiting out an auto-retry backoff: act on it now instead.
+      this.delayed.delete(job);
+      job.retryAt = undefined;
       if (requeue) {
         // Move to the back of the line.
         this.queue = this.queue.filter((j) => j !== job);
@@ -484,13 +587,27 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
   /** Hand queued jobs to idle sessions; called on enqueue and whenever a job finishes. */
   private dispatch() {
     if (this.paused) return;
+    this.pool.trimExcess(this.busySessions);
     const idle = this.pool.sessions
       .map((session, index) => ({ session, index }))
-      .filter(({ index }) => !this.busySessions.has(index))
+      .filter(({ index }) => index < this.pool.limit && !this.busySessions.has(index))
       // connected first, then never-opened/failed ones (which connect on demand)
       .sort((a, b) => Number(b.session.state === 'connected') - Number(a.session.state === 'connected') || a.index - b.index);
 
     for (const { index } of idle) {
+      // DB-response lookups first: they're quick and someone is waiting on them.
+      const li = this.lookups.findIndex((l) => !this.runningPolicies.has(l.job.policy));
+      if (li >= 0) {
+        const [{ job, password }] = this.lookups.splice(li, 1);
+        this.busySessions.add(index);
+        this.runningPolicies.add(job.policy);
+        void this.lookup(job, password, index).finally(() => {
+          this.busySessions.delete(index);
+          this.runningPolicies.delete(job.policy);
+          this.dispatch();
+        });
+        continue;
+      }
       const next = this.queue.findIndex((j) => !this.runningPolicies.has(j.policy));
       if (next < 0) return;
       const [job] = this.queue.splice(next, 1);
@@ -570,6 +687,42 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
         this.activity.log('Stopped by user', { ...ctx, level: 'warn' });
       }
       if (batch) this.finishBatchIfDone(batch);
+      this.save();
+      return;
+    }
+
+    // Transient API error (deadlock, E012, 50x): retry automatically after a randomised backoff.
+    const maxAuto = this.settings.get().autoRetries;
+    if (job.state === 'failed' && job.failure && isTransient(job.failure) && (job.autoRetries ?? 0) < maxAuto) {
+      job.autoRetries = (job.autoRetries ?? 0) + 1;
+      const delayMs = 5000 * 2 ** (job.autoRetries - 1) + Math.floor(Math.random() * 5000);
+      job.history.push({
+        attempt: job.attempts,
+        action: job.runAction,
+        session: session.id,
+        finishedAt: new Date().toISOString(),
+        failure: job.failure,
+      });
+      this.activity.log(
+        `Transient API error; auto-retry ${job.autoRetries}/${maxAuto} in ${Math.round(delayMs / 1000)}s (${job.failure.reason.slice(0, 120)})`,
+        { ...ctx, level: 'warn' },
+      );
+      job.state = 'queued';
+      job.failure = undefined;
+      job.startedAt = job.session = undefined;
+      job.retryAt = new Date(Date.now() + delayMs).toISOString();
+      if (password) this.passwords.set(job.id, password);
+      this.delayed.add(job);
+      setTimeout(() => {
+        this.delayed.delete(job);
+        job.retryAt = undefined;
+        // Cancelled/removed/moved meanwhile? Then leave it alone.
+        if (job.state !== 'queued' || this.queue.includes(job)) return;
+        if (!this.batches.some((b) => b.id === job.batchId)) return;
+        this.queue.push(job);
+        this.dispatch();
+      }, delayMs);
+      if (session.state === 'connected') this.activity.set(session.id, 'idle', 'Idle, waiting for jobs');
       this.save();
       return;
     }

@@ -264,3 +264,13 @@ tr.has-detail td { border-bottom: none; }
 .row-buttons button + button { margin-left: 4px; }
 .failure-row .chip.stopped { background: var(--code-bg); color: var(--muted); }
 .failure.stopped { color: var(--muted); }
+.card-head.wrap { flex-wrap: wrap; align-items: flex-start; }
+.settings-bar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.setting { display: flex; gap: 8px; align-items: center; }
+.setting select { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; }
+.pill.warn-pill { background: var(--warn-bg); color: var(--warn); }
+.external { margin-top: 4px; font-size: 12px; color: var(--text); word-break: break-word; }
+.external.err { color: var(--bad); }
+.external-label { font-weight: 600; color: var(--warn); }
+.small-link { font-size: 12px; padding: 0 0 0 8px; }
+.inline-pw { width: 170px; padding: 6px 8px; }

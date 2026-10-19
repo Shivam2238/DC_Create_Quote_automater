@@ -1,12 +1,9 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ActivityService, SessionActivity } from './activity.service';
+import { MAX_SESSIONS, SettingsService } from './settings.service';
 import { SshSession } from './ssh-session.service';
 
-const DEFAULT_SESSIONS = 4;
-// sshd's default MaxStartups is 10:30:100 (it starts dropping unauthenticated
-// connections beyond 10), so stay well below that.
-const MAX_SESSIONS = 8;
 
 export interface SessionInfo {
   id: number;
@@ -34,8 +31,10 @@ export class SshPoolService implements OnApplicationBootstrap, OnModuleDestroy {
   constructor(
     config: ConfigService,
     private readonly activity: ActivityService,
+    private readonly settings: SettingsService,
   ) {
-    const n = Math.min(MAX_SESSIONS, Math.max(1, Math.floor(Number(config.get('DC_SESSIONS')) || DEFAULT_SESSIONS)));
+    // All MAX_SESSIONS exist up front; only the first `limit` are used (changeable from the UI).
+    const n = MAX_SESSIONS;
     const first = new SshSession(1, config, activity);
     const waitForFirst = async () => {
       if (this.primed) return;
@@ -43,12 +42,24 @@ export class SshPoolService implements OnApplicationBootstrap, OnModuleDestroy {
       this.primed = true;
     };
     this.sessions = [first, ...Array.from({ length: n - 1 }, (_, i) => new SshSession(i + 2, config, activity, waitForFirst))];
-    for (const s of this.sessions) activity.set(s.id, 'disconnected', 'Not opened yet (opens when the queue needs it)');
-    this.logger.log(`pool size ${n}`);
+    this.sessions.forEach((s, i) =>
+      activity.set(s.id, 'disconnected', i < this.limit ? 'Not opened yet (opens when the queue needs it)' : `Off (concurrency is ${this.limit})`),
+    );
+    this.logger.log(`pool: ${this.limit} of ${n} sessions in use`);
   }
 
-  get size(): number {
-    return this.sessions.length;
+  /** Sessions currently allowed to take jobs (the UI's concurrency setting). */
+  get limit(): number {
+    return this.settings.get().concurrency;
+  }
+
+  /** After lowering the limit: close idle sessions beyond it (busy ones close when their job ends). */
+  trimExcess(busyIndexes: Set<number>) {
+    this.sessions.forEach((s, i) => {
+      if (i < this.limit || busyIndexes.has(i)) return;
+      if (s.state !== 'disconnected') s.abort(`concurrency lowered to ${this.limit}`);
+      this.activity.set(s.id, 'disconnected', `Off (concurrency is ${this.limit})`);
+    });
   }
 
   onApplicationBootstrap() {
@@ -90,8 +101,9 @@ export class SshPoolService implements OnApplicationBootstrap, OnModuleDestroy {
     if (this.sessions.some((s) => s.state === 'connected')) this.primed = true;
   }
 
+  /** Sessions within the limit, plus any beyond it that are still open/finishing a job. */
   info(): SessionInfo[] {
-    return this.sessions.map((s) => ({
+    return this.sessions.filter((s, i) => i < this.limit || s.state !== 'disconnected').map((s) => ({
       id: s.id,
       state: s.state,
       lastError: s.lastError,

@@ -5,6 +5,7 @@ import {
   type Action,
   type BatchDetail,
   type BatchSummary,
+  type DbLogs,
   type FailureKind,
   type Job,
   type SessionInfo,
@@ -195,28 +196,61 @@ function jobDuration(j: Job, now: number): number | undefined {
   return (j.finishedAt ? Date.parse(j.finishedAt) : now) - Date.parse(j.startedAt)
 }
 
-function csvReport(detail: BatchDetail): string {
-  const esc = (v: unknown) => {
-    const s = v === undefined || v === null ? '' : String(v)
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-  }
-  const header = [
-    'policy_number', 'status', 'failure_type', 'failure_reason', 'may_have_created_quote', 'quote_number', 'premium',
-    'premium_matched', 'cohort', 'http_status', 'request_payload', 'response_payload', 'attempts', 'session',
-    'started_at', 'finished_at', 'duration_s',
-  ]
-  const rows = detail.jobs.map((j) => {
+const REPORT_HEADER = [
+  'policy_number', 'status', 'failure_type', 'failure_reason', 'may_have_created_quote', 'quote_number', 'premium',
+  'premium_matched', 'cohort', 'http_status', 'request_payload', 'response_payload', 'attempts', 'session',
+  'started_at', 'finished_at', 'duration_s',
+]
+// Text columns: digit-only values here (policy numbers) must never be treated as numbers.
+const TEXT_COLUMNS = new Set(['policy_number', 'quote_number'])
+const REPORT_WIDTHS = [22, 11, 13, 60, 12, 20, 10, 10, 8, 8, 34, 34, 8, 8, 24, 24, 10]
+
+type ReportValue = string | number | undefined
+
+/** One row per policy; shared by the CSV and Excel downloads. */
+function reportRows(detail: BatchDetail): ReportValue[][] {
+  return detail.jobs.map((j) => {
     const q = j.result?.quote
     const p = (k: string) => j.result?.payloads?.find((x) => x.kind === k)
-    const d = j.startedAt && j.finishedAt ? ((Date.parse(j.finishedAt) - Date.parse(j.startedAt)) / 1000).toFixed(1) : ''
+    const d = j.startedAt && j.finishedAt ? Number(((Date.parse(j.finishedAt) - Date.parse(j.startedAt)) / 1000).toFixed(1)) : undefined
+    const premium = q?.premium !== undefined && q.premium !== '' && !isNaN(Number(q.premium)) ? Number(q.premium) : q?.premium
     return [
-      j.policy, j.state, j.failure ? KIND_LABEL[j.failure.kind] : '', j.failure?.reason, j.failure ? (j.failure.mayHaveRun ? 'yes' : 'no') : '',
-      q?.quoteNumber, q?.premium, q?.isPremiumMatched === undefined ? '' : q.isPremiumMatched === '1' ? 'yes' : 'no',
+      j.policy, j.state, j.failure ? KIND_LABEL[j.failure.kind] : undefined, j.failure?.reason,
+      j.failure ? (j.failure.mayHaveRun ? 'yes' : 'no') : undefined,
+      q?.quoteNumber, premium, q?.isPremiumMatched === undefined ? undefined : q.isPremiumMatched === '1' ? 'yes' : 'no',
       q?.cohortType, q?.httpStatus, p('request')?.file ?? p('request')?.status, p('response')?.file ?? p('response')?.status,
       j.attempts, j.session, j.startedAt, j.finishedAt, d,
-    ].map(esc).join(',')
+    ]
   })
-  return [header.join(','), ...rows].join('\n') + '\n'
+}
+
+/** Plain CSV for scripts/tools. (Excel shows 19-digit numbers as 2.8E+18: use the Excel download there.) */
+function csvReport(detail: BatchDetail): string {
+  const esc = (v: ReportValue) => {
+    const s = v === undefined ? '' : String(v)
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  return [REPORT_HEADER, ...reportRows(detail)].map((r) => r.map(esc).join(',')).join('\n') + '\n'
+}
+
+/** .xlsx with policy/quote numbers stored as text cells, so they show exactly. Library is loaded on demand. */
+async function downloadExcelReport(detail: BatchDetail, fileName: string) {
+  const { default: writeExcelFile } = await import('write-excel-file/browser')
+  const header = REPORT_HEADER.map((h) => ({ value: h, type: String, fontWeight: 'bold' as const }))
+  const rows = reportRows(detail).map((r) =>
+    r.map((v, i) =>
+      v === undefined
+        ? null
+        : TEXT_COLUMNS.has(REPORT_HEADER[i]) || typeof v === 'string'
+          ? { value: String(v), type: String }
+          : { value: v, type: Number },
+    ),
+  )
+  await writeExcelFile([header, ...rows], {
+    sheet: 'Report',
+    columns: REPORT_WIDTHS.map((width) => ({ width })),
+    stickyRowsCount: 1,
+  }).toFile(fileName)
 }
 
 export function BatchDetailView(props: {
@@ -260,6 +294,7 @@ export function BatchDetailView(props: {
   const quoteNumbers = jobs.map((j) => j.result?.quote?.quoteNumber).filter(Boolean) as string[]
   const failedPolicies = jobs.filter((j) => j.state === 'failed').map((j) => j.policy)
   const elapsed = (b.finishedAt ? Date.parse(b.finishedAt) : now) - Date.parse(b.createdAt)
+  const fileBase = b.name.replace(/[^\w.-]+/g, '_')
 
   async function act(fn: () => Promise<unknown>) {
     setWorking(true)
@@ -371,13 +406,18 @@ export function BatchDetailView(props: {
         <div className="callout">
           <div className="callout-body">
             <strong>
-              {retryable.length} polic{retryable.length === 1 ? 'y' : 'ies'} failed because of a{' '}
-              {retryable.every((j) => j.failure!.kind === 'connection') ? 'connection problem on our side' : 'connection or server problem'}
+              {retryable.length} polic{retryable.length === 1 ? 'y' : 'ies'} failed because of{' '}
+              {retryable.every((j) => j.failure!.kind === 'connection')
+                ? 'a connection problem on our side'
+                : retryable.every((j) => j.failure!.kind === 'server')
+                  ? 'a temporary error in the create-quote service'
+                  : 'a connection or create-quote service problem'}
               .
             </strong>
             <p>
-              The connection probably broke (SSH/IAP drop, timeout or gateway error); the policy data itself looks fine.
-              Retrying should work.
+              {retryable.every((j) => j.failure!.kind === 'server')
+                ? 'E012 / deadlock / 50x errors come from the wrapper or DuckCreek, not from the policy data. Retrying usually works, and fewer parallel sessions means fewer deadlocks. Use 🗄 DB response to see what DuckCreek actually returned.'
+                : 'The connection probably broke (SSH/IAP drop, timeout or gateway error); the policy data itself looks fine. Retrying should work.'}
             </p>
             {payloadOnly.length > 0 && (
               <p className="small">
@@ -387,7 +427,7 @@ export function BatchDetailView(props: {
             )}
             {riskyRetry.length > 0 && (
               <p className="small warn-text">
-                ⚠ {riskyRetry.length} of them may have reached create-quote before the connection broke (
+                ⚠ {riskyRetry.length} of them may have reached create-quote before failing (
                 {riskyRetry.map((j) => j.policy).join(', ')}). Retrying could create a second quote for those.
               </p>
             )}
@@ -419,8 +459,19 @@ export function BatchDetailView(props: {
       )}
 
       <div className="report-actions">
-        <button className="ghost" onClick={() => downloadText(`${b.name.replace(/[^\w.-]+/g, '_')}_report.csv`, csvReport(detail), 'text/csv')}>
-          ⤓ Download report (CSV)
+        <button
+          className="ghost"
+          onClick={() => act(() => downloadExcelReport(detail, `${fileBase}_report.xlsx`))}
+          title="Policy numbers are stored as text, so Excel/Sheets show them exactly"
+        >
+          ⤓ Download report (Excel)
+        </button>
+        <button
+          className="ghost"
+          onClick={() => downloadText(`${fileBase}_report.csv`, csvReport(detail), 'text/csv')}
+          title="Plain CSV for scripts. Excel shows 19-digit policy numbers as 2.8E+18; use the Excel download for that."
+        >
+          CSV
         </button>
         <button className="ghost" disabled={!quoteNumbers.length} onClick={() => copy(quoteNumbers.join('\n'))}>
           Copy quote numbers ({quoteNumbers.length})
@@ -428,6 +479,28 @@ export function BatchDetailView(props: {
         <button className="ghost" disabled={!failedPolicies.length} onClick={() => copy(failedPolicies.join('\n'))}>
           Copy failed policies ({failedPolicies.length})
         </button>
+        {failedPolicies.length > 0 && (
+          <>
+            <button
+              className="ghost"
+              disabled={working || (!props.pgConfigured && !props.pgPassword)}
+              onClick={() => act(() => api.fetchDbLogs(b.id, undefined, props.pgPassword))}
+              title="Look up the latest external_request / external_response in api_logs for every failed policy (no new create-quote call)"
+            >
+              🗄 Fetch DB responses ({failedPolicies.length})
+            </button>
+            {!props.pgConfigured && !props.pgPassword && (
+              <input
+                type="password"
+                className="inline-pw"
+                autoComplete="off"
+                placeholder="Postgres password"
+                value={props.pgPassword}
+                onChange={(e) => props.setPgPassword(e.target.value)}
+              />
+            )}
+          </>
+        )}
         <span className="spacer" />
         {b.queued > 0 && (
           <button className="ghost" disabled={working} onClick={() => act(() => api.cancel(b.id))}>
@@ -479,6 +552,8 @@ export function BatchDetailView(props: {
                   canRetry={!working && (!retryNeedsPw([j]) || !!props.pgPassword)}
                   onRetry={() => retry([j.id])}
                   onStop={(requeue) => act(() => api.stop(b.id, j.id, requeue))}
+                  canFetchDb={!working && (props.pgConfigured || !!props.pgPassword)}
+                  onFetchDb={() => act(() => api.fetchDbLogs(b.id, [j.id], props.pgPassword))}
                   onView={props.onView}
                 />
               ))
@@ -497,6 +572,8 @@ function JobRow(props: {
   canRetry: boolean
   onRetry: () => void
   onStop: (requeue: boolean) => void
+  canFetchDb: boolean
+  onFetchDb: () => void
   onView: (v: Viewing) => void
 }) {
   const { job: j } = props
@@ -517,6 +594,13 @@ function JobRow(props: {
     pill = <span className="pill good">Succeeded</span>
   } else if (j.state === 'cancelled') {
     pill = <span className="pill">{j.failure?.kind === 'stopped' ? 'Stopped' : 'Cancelled'}</span>
+  } else if (j.retryAt) {
+    const secs = Math.max(0, Math.ceil((Date.parse(j.retryAt) - props.now) / 1000))
+    pill = (
+      <span className="pill warn-pill" title={j.history.at(-1)?.failure.reason}>
+        Auto-retry {j.autoRetries} in {secs}s
+      </span>
+    )
   } else {
     pill = <span className="pill">Queued</span>
   }
@@ -601,6 +685,20 @@ function JobRow(props: {
               ↻ {j.state === 'failed' ? 'Retry' : 'Requeue'}
             </button>
           )}
+          {j.state === 'failed' && (
+            <button
+              className="ghost tiny"
+              disabled={!props.canFetchDb || j.dbLogs?.state === 'queued' || j.dbLogs?.state === 'running'}
+              onClick={props.onFetchDb}
+              title={
+                props.canFetchDb
+                  ? 'Fetch the latest external_request / external_response from api_logs (no new create-quote call)'
+                  : 'Enter the Postgres password first'
+              }
+            >
+              🗄 DB
+            </button>
+          )}
         </td>
       </tr>
       {(j.state === 'failed' || (j.state === 'cancelled' && j.failure)) && j.failure && (
@@ -616,6 +714,12 @@ function JobRow(props: {
               )}
               {j.action === 'all' && q?.success && <span className="chip info">Quote created; retry fetches payloads only</span>}
             </div>
+            {j.result?.externalError && (
+              <div className="external">
+                <span className="external-label">DuckCreek response:</span> {j.result.externalError}
+              </div>
+            )}
+            {j.dbLogs && <DbLogsLine policy={j.policy} logs={j.dbLogs} onView={props.onView} />}
             {j.history.length > 0 && (
               <details className="history">
                 <summary className="small muted">{j.history.length} earlier attempt{j.history.length === 1 ? '' : 's'}</summary>
@@ -651,5 +755,27 @@ function JobRow(props: {
         </tr>
       )}
     </>
+  )
+}
+
+/** Result of an on-demand api_logs lookup for a failed policy. */
+function DbLogsLine({ policy, logs, onView }: { policy: string; logs: DbLogs; onView: (v: Viewing) => void }) {
+  if (logs.state === 'queued' || logs.state === 'running') {
+    return <div className="external muted">🗄 {logs.state === 'queued' ? 'Waiting for a session to fetch the DB response…' : 'Fetching DB response from api_logs…'}</div>
+  }
+  const when = logs.fetchedAt ? ` (fetched ${fmtTime(logs.fetchedAt)})` : ''
+  return (
+    <div className={`external ${logs.state === 'error' ? 'err' : ''}`}>
+      <span className="external-label">🗄 DB response{when}:</span>{' '}
+      {logs.state === 'error' ? logs.error : (logs.summary ?? 'no error text found in external_response, open it to check')}
+      {logs.payloads?.map(
+        (p) =>
+          p.file && (
+            <button key={p.kind} className="link small-link" onClick={() => onView({ title: `${policy} · DB ${p.kind}`, file: p.file })}>
+              {p.kind === 'request' ? 'Request' : 'Response'}
+            </button>
+          ),
+      )}
+    </div>
   )
 }

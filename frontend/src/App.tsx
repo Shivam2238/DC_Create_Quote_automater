@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ActivityLog, SessionCards } from './Activity'
-import { api, type ActivityEvent, type AppState, type BatchStatus, type Status } from './api'
+import { api, type ActivityEvent, type AppState, type BatchStatus, type Settings, type Status } from './api'
 import { BatchDetailView, BatchList, Composer } from './Batches'
 import { JsonViewer, Toasts, type Toast, type Viewing } from './ui'
 
@@ -8,6 +8,42 @@ import { JsonViewer, Toasts, type Toast, type Viewing } from './ui'
 const POLL_BUSY_MS = 1000
 const POLL_IDLE_MS = 4000
 const MAX_LOG_LINES = 500
+
+/** Concurrency (1..max parallel SSH sessions) and auto-retry count; applied immediately. */
+function SettingsBar({ settings, onChange }: { settings: Settings; onChange: (p: Partial<Settings>) => void }) {
+  return (
+    <div className="settings-bar">
+      <div className="setting">
+        <span className="small muted" id="conc-label" title="How many policies run at once (one SSH session each)">
+          Parallel sessions
+        </span>
+        <div className="segmented small-seg" role="radiogroup" aria-labelledby="conc-label">
+          {Array.from({ length: settings.maxSessions }, (_, i) => i + 1).map((n) => (
+            <button
+              key={n}
+              role="radio"
+              aria-checked={settings.concurrency === n}
+              className={settings.concurrency === n ? 'on' : ''}
+              onClick={() => settings.concurrency !== n && onChange({ concurrency: n })}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+      </div>
+      <label className="setting" title="Automatic retries for transient create-quote errors (deadlock, E012, 502/503/504), with backoff">
+        <span className="small muted">Auto-retry</span>
+        <select value={settings.autoRetries} onChange={(e) => onChange({ autoRetries: Number(e.target.value) })}>
+          {Array.from({ length: settings.maxAutoRetries + 1 }, (_, i) => i).map((n) => (
+            <option key={n} value={n}>
+              {n === 0 ? 'Off' : `${n}×`}
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  )
+}
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
@@ -163,7 +199,7 @@ export default function App() {
           )}
           {sessions.length > 0 && (
             <span className={`pill ${sessionClass}`}>
-              SSH: {connected}/{sessions.length} connected{connecting && ' (connecting…)'}
+              SSH: {connected}/{state?.settings.concurrency ?? sessions.length} connected{connecting && ' (connecting…)'}
               {status && ` · ${status.vm.local ? 'local' : status.vm.name}`}
             </span>
           )}
@@ -241,9 +277,24 @@ export default function App() {
 
       {sessions.length > 0 && (
         <section className="card">
-          <div className="card-head">
-            <h2>SSH sessions</h2>
-            <span className="muted small">What each session is doing right now</span>
+          <div className="card-head wrap">
+            <div>
+              <h2>SSH sessions</h2>
+              <span className="muted small">What each session is doing right now</span>
+            </div>
+            {state?.settings && (
+              <SettingsBar
+                settings={state.settings}
+                onChange={async (patch) => {
+                  try {
+                    await api.updateSettings(patch)
+                  } catch (e) {
+                    pushToast({ tone: 'bad', title: 'Could not change setting', body: (e as Error).message })
+                  }
+                  void refresh()
+                }}
+              />
+            )}
           </div>
           <SessionCards sessions={sessions} />
         </section>

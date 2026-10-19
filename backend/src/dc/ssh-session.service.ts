@@ -231,7 +231,7 @@ export class SshSession {
         // We ended it on purpose: not a fault, so no "session down" banner.
         this.lastError = '';
         this.activity.set(this.id, 'disconnected', 'Restarting; reconnects on its next job');
-        this.log(`Session restarted: ${reason}`, 'warn');
+        this.log(`Session closed: ${reason}`, 'warn');
       }
     }
     if (this.pending) {

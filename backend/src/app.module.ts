@@ -7,6 +7,7 @@ import { DcController } from './dc/dc.controller';
 import { DcService } from './dc/dc.service';
 import { JobQueueService } from './dc/job-queue.service';
 import { RemoteRunnerService } from './dc/remote-runner.service';
+import { SettingsService } from './dc/settings.service';
 import { SshPoolService } from './dc/ssh-pool.service';
 
 @Module({
@@ -19,6 +20,6 @@ import { SshPoolService } from './dc/ssh-pool.service';
     }),
   ],
   controllers: [DcController],
-  providers: [ActivityService, SshPoolService, RemoteRunnerService, DcService, JobQueueService],
+  providers: [SettingsService, ActivityService, SshPoolService, RemoteRunnerService, DcService, JobQueueService],
 })
 export class AppModule {}

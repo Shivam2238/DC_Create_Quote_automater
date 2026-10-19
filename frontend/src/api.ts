@@ -22,6 +22,17 @@ export interface RunResult {
   policy: string
   quote?: QuoteResult
   payloads?: PayloadResult[]
+  /** Error text found in DuckCreek's external_response when create-quote failed. */
+  externalError?: string
+}
+
+export interface DbLogs {
+  state: 'queued' | 'running' | 'done' | 'error'
+  requestedAt: string
+  fetchedAt?: string
+  payloads?: PayloadResult[]
+  summary?: string
+  error?: string
 }
 
 /**
@@ -65,6 +76,17 @@ export interface Job {
   result?: RunResult
   failure?: Failure
   history: Attempt[]
+  autoRetries?: number
+  /** Waiting for an automatic retry that starts at this time. */
+  retryAt?: string
+  dbLogs?: DbLogs
+}
+
+export interface Settings {
+  concurrency: number
+  autoRetries: number
+  maxSessions: number
+  maxAutoRetries: number
 }
 
 export type BatchStatus = 'running' | 'succeeded' | 'failed' | 'cancelled'
@@ -123,6 +145,7 @@ export interface AppState {
   sessions: SessionInfo[]
   pending: number
   vmBusy: '' | 'reconnecting' | 'disconnecting'
+  settings: Settings
   batches: BatchSummary[]
   selected: BatchDetail | null
   events: ActivityEvent[]
@@ -165,6 +188,10 @@ export const api = {
     send('POST', `/api/batches/${id}/retry`, { jobIds, pgPassword: pgPassword || undefined }).then((r) => json<BatchDetail>(r)),
   stop: (id: string, jobId: string, requeue: boolean) =>
     send('POST', `/api/batches/${id}/jobs/${jobId}/stop`, { requeue }).then((r) => json<BatchDetail>(r)),
+  fetchDbLogs: (id: string, jobIds?: string[], pgPassword?: string) =>
+    send('POST', `/api/batches/${id}/db-logs`, { jobIds, pgPassword: pgPassword || undefined }).then((r) => json<BatchDetail>(r)),
+  updateSettings: (patch: Partial<Pick<Settings, 'concurrency' | 'autoRetries'>>) =>
+    send('PATCH', '/api/settings', patch).then((r) => json<Settings>(r)),
   vmReconnect: () => send('POST', '/api/vm/reconnect').then((r) => json<{ result: string; sessions: SessionInfo[] }>(r)),
   vmDisconnect: () => send('POST', '/api/vm/disconnect').then((r) => json<{ result: string; sessions: SessionInfo[] }>(r)),
   reconnect: () => send('POST', '/api/session/reconnect').then((r) => json<SessionInfo[]>(r)),

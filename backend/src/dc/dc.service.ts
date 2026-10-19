@@ -56,6 +56,36 @@ export interface RunResult {
   policy: string;
   quote?: QuoteResult;
   payloads?: PayloadResult[];
+  /** When create-quote failed: the error found in DuckCreek's own external_response. */
+  externalError?: string;
+}
+
+const ERROR_KEY = /message|error|fault|exception|detail|description|reason/i;
+const ERROR_TEXT = /deadlock|exception|error|fail|timeout|invalid|not found|violat|denied|rerun|unable|cannot/i;
+
+/**
+ * Pull the human-readable error(s) out of a DuckCreek external_response: strings under
+ * message/error/fault/exception-like keys that read like an error, plus anything
+ * mentioning a deadlock. The wrapper's E012 hides these.
+ */
+export function summarizeExternal(value: unknown): string | undefined {
+  const found: string[] = [];
+  const walk = (v: unknown, key: string, depth: number) => {
+    if (depth > 12 || found.length >= 6) return;
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if (t && ((ERROR_KEY.test(key) && ERROR_TEXT.test(t)) || /deadlock/i.test(t) || /error|fault|exception/i.test(key))) {
+        const clean = t.replace(/\s+/g, ' ').slice(0, 300);
+        if (!found.includes(clean)) found.push(clean);
+      }
+    } else if (Array.isArray(v)) {
+      v.forEach((x) => walk(x, key, depth + 1));
+    } else if (v && typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) walk(x, k, depth + 1);
+    }
+  };
+  walk(value, '', 0);
+  return found.length ? found.join(' | ').slice(0, 900) : undefined;
 }
 
 export interface RunOutcome {
@@ -104,10 +134,26 @@ function classifyRemote(step: 'quote' | 'payload', code: number, stderr: string)
   return { kind: 'connection', step, mayHaveRun: false, reason: `Postgres query failed: ${text}` };
 }
 
+/** "message [errorCode]: detail; detail" — the detail is where e.g. DuckCreek deadlocks show up. */
 function apiMessage(resp: any): string {
+  const str = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
   const msg = resp?.message ?? resp?.error ?? resp?.data?.message ?? resp?.errors;
-  if (msg) return typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 300);
-  return JSON.stringify(resp).slice(0, 300);
+  if (!msg) return JSON.stringify(resp).slice(0, 300);
+  const code = resp?.errorCode ? ` [${resp.errorCode}]` : '';
+  const detail = resp?.detailedErrorMessage;
+  const details = Array.isArray(detail) ? detail.map(str).join('; ') : detail ? str(detail) : '';
+  return `${str(msg)}${code}${details ? `: ${details}` : ''}`.slice(0, 600);
+}
+
+/**
+ * Transient create-quote failures that are safe to retry automatically: DB deadlocks
+ * (the losing transaction is rolled back), E012 "quote missing in response", and
+ * gateway 502/503/504. Timeouts are excluded: the original call may still create a quote.
+ */
+export function isTransient(f: Failure): boolean {
+  if (f.kind !== 'server' || f.step !== 'quote') return false;
+  if (/didn't respond/i.test(f.reason)) return false;
+  return /deadlock|\[E012\]|missing in response|HTTP 50[234]|Service Unavailable/i.test(f.reason);
 }
 
 @Injectable()
@@ -194,8 +240,30 @@ export class DcService {
       }
       const saved = result.payloads.map((p) => `${p.kind}: ${p.status}`).join(', ');
       progress(`Payloads ${saved}`, { level: missing.length ? 'warn' : 'success' });
+      if (result.quote && !result.quote.success) {
+        result.externalError = await this.externalSummary(result.payloads);
+        if (result.externalError) progress(`DuckCreek response: ${result.externalError}`, { level: 'warn' });
+      }
     }
     return { result, failure };
+  }
+
+  /** Error text from a saved external_response file (see summarizeExternal). */
+  async externalSummary(payloads?: PayloadResult[]): Promise<string | undefined> {
+    const file = payloads?.find((p) => p.kind === 'response' && p.file)?.file;
+    if (!file) return undefined;
+    try {
+      const text = await fs.readFile(path.join(this.outDir, file), 'utf8');
+      let value: unknown = text;
+      try {
+        value = JSON.parse(text);
+      } catch {
+        // raw text response: summarise as-is
+      }
+      return summarizeExternal(value) ?? (typeof value === 'string' ? value.slice(0, 300) : undefined);
+    } catch {
+      return undefined;
+    }
   }
 
   private classifyQuote(q: QuoteResult): Failure {
