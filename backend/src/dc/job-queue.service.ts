@@ -12,6 +12,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFil
 import * as path from 'path';
 import { ActivityService, Phase } from './activity.service';
 import { Action, DcService, Failure, isTransient, PayloadResult, RETRYABLE, RunResult } from './dc.service';
+import { isProduct, Product, PRODUCT_INFO, productOf } from './products';
 import { SettingsService } from './settings.service';
 import { SshPoolService } from './ssh-pool.service';
 import { SessionLostError, spawnOnce } from './ssh-session.service';
@@ -29,6 +30,7 @@ export interface Attempt {
 export interface Job {
   id: string;
   batchId: string;
+  product: Product;
   policy: string;
   /** What the batch asked for. */
   action: Action;
@@ -65,6 +67,7 @@ export interface DbLogs {
 export interface Batch {
   id: string;
   name: string;
+  product: Product;
   action: Action;
   createdAt: string;
   finishedAt?: string;
@@ -76,6 +79,7 @@ export type BatchStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 export interface BatchSummary {
   id: string;
   name: string;
+  product: Product;
   action: Action;
   createdAt: string;
   finishedAt?: string;
@@ -92,10 +96,10 @@ export interface BatchSummary {
 
 const MAX_BATCHES = 100;
 
-function defaultBatchName(d = new Date()): string {
+function defaultBatchName(product: Product, d = new Date()): string {
   const date = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
   const time = d.toLocaleTimeString('en-GB', { hour12: false });
-  return `${date} · ${time}`;
+  return `${PRODUCT_INFO[product].label} · ${date} · ${time}`;
 }
 
 const isActive = (j: Job) => j.state === 'queued' || j.state === 'running';
@@ -150,6 +154,9 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     // Anything unfinished when the server stopped can't resume (passwords aren't stored).
     const now = new Date().toISOString();
     for (const b of this.batches) {
+      // Batches from before Motor support are Health.
+      b.product ??= 'health';
+      for (const j of b.jobs) j.product ??= b.product;
       for (const j of b.jobs) {
         if (j.dbLogs && (j.dbLogs.state === 'queued' || j.dbLogs.state === 'running')) {
           j.dbLogs = { ...j.dbLogs, state: 'error', error: 'The console server restarted before the lookup finished' };
@@ -234,7 +241,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     this.activity.set(session.id, 'payload', 'Fetching DB response (api_logs)…', job.policy, 'payloads');
     this.activity.log('Fetching DB response from api_logs…', ctx);
     try {
-      const { result, failure } = await this.dc.run(job.policy, 'payloads', session, password, (msg, opts = {}) => {
+      const { result, failure } = await this.dc.run(job.product, job.policy, 'payloads', session, password, (msg, opts = {}) => {
         if (opts.phase) this.activity.set(session.id, opts.phase, msg, job.policy, 'payloads');
       });
       const summary = await this.dc.externalSummary(result.payloads);
@@ -300,6 +307,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     return {
       id: b.id,
       name: b.name,
+      product: b.product,
       action: b.action,
       createdAt: b.createdAt,
       finishedAt: b.finishedAt,
@@ -316,18 +324,25 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
 
   // ---------------------------------------------------------------- commands
 
-  create(policies: string[], action: Action, name?: string, pgPassword?: string) {
+  create(product: Product, policies: string[], action: Action, name?: string, pgPassword?: string) {
+    if (!isProduct(product)) throw new BadRequestException('product must be "health" or "motor"');
     const list = [...new Set((policies ?? []).map((p) => String(p).trim()).filter(Boolean))];
     if (!list.length) throw new BadRequestException('no policy numbers given');
     const bad = list.filter((p) => !/^\d+$/.test(p));
     if (bad.length) throw new BadRequestException(`policy number must be digits only: ${bad.join(', ')}`);
+    const wrong = list.filter((p) => productOf(p) !== product);
+    if (wrong.length) {
+      const { label, prefix } = PRODUCT_INFO[product];
+      throw new BadRequestException(`${label} policy numbers start with ${prefix}; not ${label}: ${wrong.join(', ')}`);
+    }
     if (!['quote', 'payloads', 'all'].includes(action)) throw new BadRequestException('invalid action');
     this.requirePassword(action, pgPassword);
 
     const now = new Date();
     const batch: Batch = {
       id: randomUUID(),
-      name: name?.trim().slice(0, 100) || defaultBatchName(now),
+      name: name?.trim().slice(0, 100) || defaultBatchName(product, now),
+      product,
       action,
       createdAt: now.toISOString(),
       jobs: [],
@@ -335,6 +350,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     batch.jobs = list.map<Job>((policy) => ({
       id: randomUUID(),
       batchId: batch.id,
+      product,
       policy,
       action,
       runAction: action,
@@ -346,7 +362,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     this.batches.push(batch);
     this.trim();
     this.enqueue(batch.jobs, pgPassword);
-    this.activity.log(`Batch "${batch.name}" started: ${list.length} polic${list.length === 1 ? 'y' : 'ies'} (${action})`, {
+    this.activity.log(`${PRODUCT_INFO[product].label} batch "${batch.name}" started: ${list.length} polic${list.length === 1 ? 'y' : 'ies'} (${action})`, {
       batch: batch.id,
     });
     this.save();
@@ -642,7 +658,7 @@ export class JobQueueService implements OnModuleInit, OnModuleDestroy {
     this.save();
 
     try {
-      const { result, failure } = await this.dc.run(job.policy, job.runAction, session, password, (msg, opts = {}) => {
+      const { result, failure } = await this.dc.run(job.product, job.policy, job.runAction, session, password, (msg, opts = {}) => {
         if (opts.phase === 'quote') step_ = 'quote';
         if (opts.phase === 'payload' || opts.phase === 'saving') step_ = 'payload';
         if (opts.phase) step(msg, opts.phase);

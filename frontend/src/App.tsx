@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ActivityLog, SessionCards } from './Activity'
-import { api, type ActivityEvent, type AppState, type BatchStatus, type Settings, type Status } from './api'
+import { api, PRODUCT_INFO, PRODUCTS, type ActivityEvent, type AppState, type BatchStatus, type Product, type Settings, type Status } from './api'
 import { BatchDetailView, BatchList, Composer } from './Batches'
 import { JsonViewer, Toasts, type Toast, type Viewing } from './ui'
 
@@ -49,10 +49,10 @@ export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
   const [apiError, setApiError] = useState('')
   const [state, setState] = useState<AppState | null>(null)
-  // Selected batch lives in the URL (#batch=<id>) so reloads and bookmarks keep it.
-  const [selectedId, setSelectedId] = useState<string | undefined>(
-    () => new URLSearchParams(location.hash.slice(1)).get('batch') ?? undefined,
-  )
+  // Product and selected batch live in the URL (#product=motor&batch=<id>) so reloads and bookmarks keep them.
+  const hashParams = new URLSearchParams(location.hash.slice(1))
+  const [product, setProduct] = useState<Product>(() => (hashParams.get('product') === 'motor' ? 'motor' : 'health'))
+  const [selectedId, setSelectedId] = useState<string | undefined>(() => hashParams.get('batch') ?? undefined)
   const [events, setEvents] = useState<ActivityEvent[]>([])
   const [pgPassword, setPgPassword] = useState('')
   const [viewing, setViewing] = useState<Viewing | null>(null)
@@ -62,6 +62,9 @@ export default function App() {
   const lastSeq = useRef(0)
   const selectedRef = useRef<string | undefined>(undefined)
   selectedRef.current = selectedId
+  const productRef = useRef<Product>(product)
+  productRef.current = product
+  const firstLoad = useRef(true)
   const prevStatus = useRef<Map<string, BatchStatus> | null>(null)
   const toastId = useRef(0)
 
@@ -101,16 +104,29 @@ export default function App() {
                 `${b.succeeded} succeeded, ${b.failed} failed` +
                 (b.retryable ? ` (${b.retryable} worth retrying)` : '') +
                 (b.cancelled ? `, ${b.cancelled} cancelled` : ''),
-              action: { label: 'View report', onClick: () => setSelectedId(b.id) },
+              action: {
+                label: 'View report',
+                onClick: () => {
+                  setProduct(b.product)
+                  setSelectedId(b.id)
+                },
+              },
             })
           }
         }
       }
       prevStatus.current = new Map(s.batches.map((b) => [b.id, b.status]))
 
-      // Keep a valid selection: default to the newest batch.
-      if (!selectedRef.current || !s.batches.some((b) => b.id === selectedRef.current)) {
-        setSelectedId(s.batches[0]?.id)
+      // A bookmarked batch decides the product on first load.
+      const sel = s.batches.find((b) => b.id === selectedRef.current)
+      if (firstLoad.current && sel && sel.product !== productRef.current) {
+        productRef.current = sel.product
+        setProduct(sel.product)
+      }
+      firstLoad.current = false
+      // Keep a valid selection within the current product: default to its newest batch.
+      if (!sel || sel.product !== productRef.current) {
+        setSelectedId(s.batches.find((b) => b.product === productRef.current)?.id)
       }
       setState(s)
       setApiError('')
@@ -124,9 +140,17 @@ export default function App() {
   }, [refreshStatus])
 
   useEffect(() => {
-    const hash = selectedId ? `#batch=${selectedId}` : ''
-    if (location.hash !== hash) history.replaceState(null, '', hash || location.pathname)
-  }, [selectedId])
+    const hash = `#product=${product}${selectedId ? `&batch=${selectedId}` : ''}`
+    if (location.hash !== hash) history.replaceState(null, '', hash)
+  }, [product, selectedId])
+
+  /** Health and Motor run separately: switching scopes the composer, batch list and report. */
+  function switchProduct(p: Product) {
+    if (p === product) return
+    productRef.current = p
+    setProduct(p)
+    setSelectedId(state?.batches.find((b) => b.product === p)?.id)
+  }
 
   const busy = !!state && (state.pending > 0 || state.sessions.some((s) => s.state === 'connecting'))
   useEffect(() => {
@@ -137,8 +161,9 @@ export default function App() {
 
   const runningBatches = state?.batches.filter((b) => b.status === 'running').length ?? 0
   useEffect(() => {
-    document.title = runningBatches ? `(${runningBatches} running) DC UAT Console` : 'DC UAT Console'
-  }, [runningBatches])
+    const base = `DC UAT Console · ${PRODUCT_INFO[product].label}`
+    document.title = runningBatches ? `(${runningBatches} running) ${base}` : base
+  }, [runningBatches, product])
 
   const sessions = state?.sessions ?? status?.sessions ?? []
   const connected = sessions.filter((s) => s.state === 'connected').length
@@ -190,6 +215,24 @@ export default function App() {
           <h1>DC UAT Console</h1>
           <p className="sub">Create quotes and pull DuckCreek api_logs payloads from the UAT VM, in batches</p>
         </div>
+        <div className="product-switch" role="tablist" aria-label="Product">
+          {PRODUCTS.map((p) => {
+            const running = state?.batches.filter((b) => b.product === p && b.status === 'running').length ?? 0
+            return (
+              <button
+                key={p}
+                role="tab"
+                aria-selected={product === p}
+                className={`product-tab ${p} ${product === p ? 'on' : ''}`}
+                onClick={() => switchProduct(p)}
+              >
+                <span className="product-name">{PRODUCT_INFO[p].label}</span>
+                <span className="product-prefix">{PRODUCT_INFO[p].prefix}…</span>
+                {running > 0 && <span className="product-running" title={`${running} running`}>{running}</span>}
+              </button>
+            )
+          })}
+        </div>
         <div className="status">
           {apiError && <span className="pill bad">API unreachable: {apiError}</span>}
           {status && (
@@ -237,6 +280,8 @@ export default function App() {
       <div className="layout">
         <aside className="side">
           <Composer
+            product={product}
+            onSwitchProduct={switchProduct}
             pgPassword={pgPassword}
             setPgPassword={setPgPassword}
             pgConfigured={pgConfigured}
@@ -245,7 +290,12 @@ export default function App() {
               void refresh()
             }}
           />
-          <BatchList batches={state?.batches ?? []} selectedId={selectedId} onSelect={setSelectedId} />
+          <BatchList
+            product={product}
+            batches={(state?.batches ?? []).filter((b) => b.product === product)}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+          />
         </aside>
 
         <main className="main">

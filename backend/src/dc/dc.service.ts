@@ -3,23 +3,39 @@ import { ConfigService } from '@nestjs/config';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { Level, Phase } from './activity.service';
+import {
+  deepJson,
+  ERROR_SOURCE_KINDS,
+  parseQuoteFields,
+  PAYLOAD_KINDS,
+  payloadFileName,
+  Product,
+  PRODUCT_INFO,
+  productOf,
+  QuoteFields,
+  SERVED_FILE,
+  splitPayloadRows,
+} from './products';
 import { HTTP_MARKER, RemoteRunnerService } from './remote-runner.service';
 import { SshPoolService } from './ssh-pool.service';
 import { SshSession, spawnOnce } from './ssh-session.service';
 
 export type Action = 'quote' | 'payloads' | 'all';
-export type PayloadKind = 'request' | 'response';
+/** Health: request/response. Motor: dc_request/dc_response/blaze_request/blaze_response. */
+export type PayloadKind = string;
 
-export interface QuoteResult {
+export interface QuoteResult extends QuoteFields {
   success: boolean;
-  quoteNumber?: string;
-  premium?: string;
-  isPremiumMatched?: string;
-  cohortType?: string;
   /** HTTP status of the create-quote call, when curl got that far. */
   httpStatus?: number;
-  raw: unknown;
+  /** Wrapper response (small ones inline)… */
+  raw?: unknown;
+  /** …or saved to this file when large (Motor returns the whole DuckCreek session). */
+  rawFile?: string;
 }
+
+/** Wrapper responses bigger than this are written to a file instead of kept in the job. */
+const INLINE_RAW_LIMIT = 20_000;
 
 export interface PayloadResult {
   kind: PayloadKind;
@@ -70,39 +86,41 @@ const ERROR_TEXT = /deadlock|exception|error|fail|timeout|invalid|not found|viol
  */
 export function summarizeExternal(value: unknown): string | undefined {
   const found: string[] = [];
-  const walk = (v: unknown, key: string, depth: number) => {
-    if (depth > 12 || found.length >= 6) return;
+  const add = (t: string) => {
+    const clean = t.replace(/\s+/g, ' ').slice(0, 300);
+    if (!found.includes(clean)) found.push(clean);
+  };
+  // inError: we're inside an error/fault/exception/processingerrors block, where any
+  // message-like string is the explanation (e.g. "Vehicle IDV is outside the allowed range").
+  const walk = (v: unknown, key: string, depth: number, inError: boolean) => {
+    if (depth > 14 || found.length >= 6) return;
     if (typeof v === 'string') {
       const t = v.trim();
-      if (t && ((ERROR_KEY.test(key) && ERROR_TEXT.test(t)) || /deadlock/i.test(t) || /error|fault|exception/i.test(key))) {
-        const clean = t.replace(/\s+/g, ' ').slice(0, 300);
-        if (!found.includes(clean)) found.push(clean);
+      if (!t) return;
+      if (
+        /deadlock/i.test(t) ||
+        (ERROR_KEY.test(key) && (inError || ERROR_TEXT.test(t))) ||
+        /error|fault|exception/i.test(key)
+      ) {
+        add(t);
       }
     } else if (Array.isArray(v)) {
-      v.forEach((x) => walk(x, key, depth + 1));
+      v.forEach((x) => walk(x, key, depth + 1, inError));
     } else if (v && typeof v === 'object') {
-      for (const [k, x] of Object.entries(v)) walk(x, k, depth + 1);
+      // DuckCreek Motor attaches schema warnings even to good responses; skip them when validation passed.
+      if (key === 'ApiValidation' && (v as any).validationStatus === true) return;
+      for (const [k, x] of Object.entries(v)) {
+        walk(x, k, depth + 1, inError || /error|fault|exception/i.test(k));
+      }
     }
   };
-  walk(value, '', 0);
+  walk(value, '', 0, false);
   return found.length ? found.join(' | ').slice(0, 900) : undefined;
 }
 
 export interface RunOutcome {
   result: RunResult;
   failure?: Failure;
-}
-
-/** Columns hold JSON as text, sometimes double-encoded: unwrap until it's not a string. */
-function deepJson(value: unknown): unknown {
-  while (typeof value === 'string') {
-    try {
-      value = JSON.parse(value);
-    } catch {
-      break;
-    }
-  }
-  return value;
 }
 
 // curl exit codes: https://curl.se/libcurl/c/libcurl-errors.html
@@ -136,7 +154,8 @@ function classifyRemote(step: 'quote' | 'payload', code: number, stderr: string)
 
 /** "message [errorCode]: detail; detail" — the detail is where e.g. DuckCreek deadlocks show up. */
 function apiMessage(resp: any): string {
-  const str = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+  const str = (v: unknown) => (typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v)));
+  if (resp === undefined || resp === null) return 'empty response';
   const msg = resp?.message ?? resp?.error ?? resp?.data?.message ?? resp?.errors;
   if (!msg) return JSON.stringify(resp).slice(0, 300);
   const code = resp?.errorCode ? ` [${resp.errorCode}]` : '';
@@ -179,6 +198,7 @@ export class DcService {
    * problems (connect failure, session lost, timeout) are thrown.
    */
   async run(
+    product: Product,
     policy: string,
     action: Action,
     session: SshSession,
@@ -186,6 +206,9 @@ export class DcService {
     progress: Progress = () => undefined,
   ): Promise<RunOutcome> {
     if (!/^\d+$/.test(policy ?? '')) throw new BadRequestException('policy number must be digits only');
+    if (productOf(policy) !== product) {
+      throw new BadRequestException(`${PRODUCT_INFO[product].label} policy numbers start with ${PRODUCT_INFO[product].prefix}`);
+    }
     if (!['quote', 'payloads', 'all'].includes(action)) throw new BadRequestException('invalid action');
 
     const wantQuote = action !== 'payloads';
@@ -195,11 +218,16 @@ export class DcService {
 
     const seen = new Set<string>();
     const out = await this.runner.run(
-      this.runner.buildScript(policy, wantQuote, wantPayloads, password),
+      this.runner.buildScript(product, policy, wantQuote, wantPayloads, password),
       session,
+      this.runner.timeoutMs(product),
       (edge, tag) => {
         seen.add(`${edge}_${tag}`);
-        if (tag === 'QUOTE' && edge === 'BEGIN') progress('Calling create-quote API (curl)…', { phase: 'quote' });
+        if (tag === 'QUOTE' && edge === 'BEGIN') {
+          progress(product === 'motor' ? 'Calling create-quote API (Blaze rating → DuckCreek)…' : 'Calling create-quote API (curl)…', {
+            phase: 'quote',
+          });
+        }
         if (tag === 'QUOTE' && edge === 'END') progress('create-quote API responded');
         if (tag === 'PAYLOAD' && edge === 'BEGIN') progress(`Querying ${this.runner.apiLogsTable} in Postgres (psql)…`, { phase: 'payload' });
         if (tag === 'PAYLOAD' && edge === 'END') progress('Postgres query returned');
@@ -210,13 +238,13 @@ export class DcService {
     let failure: Failure | undefined;
 
     if (wantQuote && out.quote !== undefined) {
-      const q = (result.quote = this.parseQuote(out.quote));
+      const { quote: q, resp } = await this.parseQuote(product, policy, out.quote);
+      result.quote = q;
       if (q.success) {
-        progress(`Quote ${q.quoteNumber} created (premium ${q.premium}, matched ${q.isPremiumMatched === '1' ? 'yes' : 'no'})`, {
-          level: 'success',
-        });
+        const extra = product === 'health' ? `, matched ${q.isPremiumMatched === '1' ? 'yes' : 'no'}` : q.purePremium ? `, pure ${q.purePremium} + tax ${q.taxes}` : '';
+        progress(`Quote ${q.quoteNumber} created (premium ${q.premium}${extra})`, { level: 'success' });
       } else {
-        failure = this.classifyQuote(q);
+        failure = this.classifyQuote(product, q, resp);
         progress(`create-quote failed: ${failure.reason}`, { level: 'warn' });
       }
     }
@@ -231,26 +259,40 @@ export class DcService {
 
     if (wantPayloads && out.payload !== undefined) {
       progress('Parsing and saving payload files…', { phase: 'saving' });
-      result.payloads = await this.savePayloads(policy, out.payload);
-      const missing = result.payloads.filter((p) => p.status === 'null').map((p) => p.kind);
-      if (missing.length === 2) {
-        failure ??= { kind: 'api', step: 'payload', mayHaveRun: false, reason: `No ${this.runner.apiLogsTable} row for this policy` };
-      } else if (missing.length) {
-        failure ??= { kind: 'api', step: 'payload', mayHaveRun: false, reason: `external_${missing[0]} is NULL in ${this.runner.apiLogsTable}` };
-      }
-      const saved = result.payloads.map((p) => `${p.kind}: ${p.status}`).join(', ');
-      progress(`Payloads ${saved}`, { level: missing.length ? 'warn' : 'success' });
-      if (result.quote && !result.quote.success) {
-        result.externalError = await this.externalSummary(result.payloads);
-        if (result.externalError) progress(`DuckCreek response: ${result.externalError}`, { level: 'warn' });
+      const { payloads, dcMissing, note } = await this.savePayloads(product, policy, out.payload);
+      result.payloads = payloads;
+      failure ??= this.payloadFailure(product, payloads, dcMissing);
+      const saved = payloads.map((p) => `${p.kind}: ${p.status}`).join(', ');
+      progress(`Payloads ${saved}${note ? ` (${note})` : ''}`, { level: failure?.step === 'payload' ? 'warn' : 'success' });
+      if ((result.quote && !result.quote.success) || failure?.step === 'payload') {
+        result.externalError = await this.externalSummary(payloads);
+        if (result.externalError) progress(`External response: ${result.externalError}`, { level: 'warn' });
       }
     }
     return { result, failure };
   }
 
+  /** Missing api_logs data is an "api" failure (retrying the lookup won't conjure a row). */
+  private payloadFailure(product: Product, payloads: PayloadResult[], dcMissing?: boolean): Failure | undefined {
+    const table = this.runner.apiLogsTable;
+    const has = (k: string) => payloads.some((p) => p.kind === k && p.status !== 'null');
+    const fail = (reason: string): Failure => ({ kind: 'api', step: 'payload', mayHaveRun: false, reason });
+    if (product === 'health') {
+      if (!has('request') && !has('response')) return fail(`No ${table} row for this policy`);
+      if (!has('request')) return fail(`external_request is NULL in ${table}`);
+      if (!has('response')) return fail(`external_response is NULL in ${table}`);
+      return undefined;
+    }
+    if (!payloads.some((p) => p.status !== 'null')) return fail(`No ${table} rows for this policy`);
+    if (dcMissing) return fail('Latest attempt has only a Blaze row: the DuckCreek call was not reached (or not logged)');
+    if (!has('dc_response')) return fail(`DuckCreek external_response is NULL in ${table}`);
+    if (!has('blaze_response')) return fail(`No Blaze row found before the DuckCreek row in ${table}`);
+    return undefined;
+  }
+
   /** Error text from a saved external_response file (see summarizeExternal). */
   async externalSummary(payloads?: PayloadResult[]): Promise<string | undefined> {
-    const file = payloads?.find((p) => p.kind === 'response' && p.file)?.file;
+    const file = ERROR_SOURCE_KINDS.map((k) => payloads?.find((p) => p.kind === k && p.file)?.file).find(Boolean);
     if (!file) return undefined;
     try {
       const text = await fs.readFile(path.join(this.outDir, file), 'utf8');
@@ -266,23 +308,30 @@ export class DcService {
     }
   }
 
-  private classifyQuote(q: QuoteResult): Failure {
+  /** `resp` is the parsed wrapper response (q.raw may have been moved to a file). */
+  private classifyQuote(product: Product, q: QuoteResult, resp: unknown): Failure {
     const status = q.httpStatus ?? 0;
-    if (status >= 500 || status === 0 || typeof q.raw === 'string') {
+    // Motor: HTTP 200 + is_success but no QuoteNumber means DuckCreek answered without a quote.
+    if (product === 'motor' && status >= 200 && status < 300 && (resp as any)?.is_success) {
+      const why = summarizeExternal((resp as any)?.data) ?? 'no QuoteNumber in the DuckCreek response';
+      return { kind: 'api', step: 'quote', mayHaveRun: true, reason: `DuckCreek returned no quote: ${why}` };
+    }
+    if (status >= 500 || status === 0 || typeof resp === 'string') {
       const what = status ? `HTTP ${status}` : 'no HTTP status';
-      const body = typeof q.raw === 'string' ? q.raw.slice(0, 200) : apiMessage(q.raw);
+      const body = typeof resp === 'string' ? resp.slice(0, 200) : apiMessage(resp);
       return {
         kind: 'server',
         step: 'quote',
-        // A gateway timeout/5xx can happen after the wrapper already created the quote.
-        mayHaveRun: true,
+        // A gateway timeout/5xx can happen after the wrapper already created the quote,
+        // except a Motor failure at the Blaze step: DuckCreek is only called after Blaze.
+        mayHaveRun: !(product === 'motor' && /blaze/i.test(body)),
         reason: `create-quote service error (${what}): ${body}`,
       };
     }
-    return { kind: 'api', step: 'quote', mayHaveRun: true, reason: `API rejected (HTTP ${status}): ${apiMessage(q.raw)}` };
+    return { kind: 'api', step: 'quote', mayHaveRun: true, reason: `API rejected (HTTP ${status}): ${apiMessage(resp)}` };
   }
 
-  private parseQuote(raw: string): QuoteResult {
+  private async parseQuote(product: Product, policy: string, raw: string): Promise<{ quote: QuoteResult; resp: unknown }> {
     let httpStatus: number | undefined;
     const i = raw.lastIndexOf(HTTP_MARKER);
     if (i >= 0) {
@@ -293,38 +342,49 @@ export class DcService {
     try {
       resp = JSON.parse(raw);
     } catch {
-      return { success: false, httpStatus, raw };
+      return { quote: { success: false, httpStatus, ...(await this.keepRaw(product, policy, raw)) }, resp: raw };
     }
-    const data = resp?.data ?? {};
-    return {
-      success: !!resp?.is_success && !!data.quote_number,
-      quoteNumber: data.quote_number,
-      premium: data.premium,
-      isPremiumMatched: data.is_premium_matched,
-      cohortType: data.cohort_type,
+    const fields = parseQuoteFields(product, resp);
+    const quote: QuoteResult = {
+      success: !!resp?.is_success && !!fields.quoteNumber,
+      ...fields,
       httpStatus,
-      raw: resp,
+      ...(await this.keepRaw(product, policy, resp)),
     };
+    return { quote, resp };
   }
 
-  private async savePayloads(policy: string, raw: string): Promise<PayloadResult[]> {
-    const row = JSON.parse(raw) as Record<PayloadKind, unknown>;
-    await fs.mkdir(this.outDir, { recursive: true });
+  /** Keep small wrapper responses inline; write big ones (Motor's full session) to a file. */
+  private async keepRaw(product: Product, policy: string, value: unknown): Promise<Pick<QuoteResult, 'raw' | 'rawFile'>> {
+    const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    if (text.length <= INLINE_RAW_LIMIT) return { raw: value };
+    const file = payloadFileName(product, policy, 'quote_response', typeof value === 'string' ? 'txt' : 'json');
+    await fs.mkdir(path.dirname(path.join(this.outDir, file)), { recursive: true });
+    await fs.writeFile(path.join(this.outDir, file), text + '\n');
+    return { rawFile: file };
+  }
 
+  private async savePayloads(
+    product: Product,
+    policy: string,
+    raw: string,
+  ): Promise<{ payloads: PayloadResult[]; dcMissing?: boolean; note?: string }> {
+    const { values, dcMissing, note } = splitPayloadRows(product, raw);
     const results: PayloadResult[] = [];
-    for (const kind of ['request', 'response'] as PayloadKind[]) {
-      const value = deepJson(row[kind]);
+    for (const kind of PAYLOAD_KINDS[product]) {
+      const value = deepJson(values[kind]);
       if (value === null || value === undefined) {
         results.push({ kind, status: 'null' });
-      } else {
-        const isJson = typeof value !== 'string';
-        const file = `${policy}_${kind}_payload.${isJson ? 'json' : 'txt'}`;
-        const text = isJson ? JSON.stringify(value, null, 2) + '\n' : (value as string);
-        await fs.writeFile(path.join(this.outDir, file), text);
-        results.push({ kind, status: isJson ? 'saved' : 'not-json', file, size: Buffer.byteLength(text) });
+        continue;
       }
+      const isJson = typeof value !== 'string';
+      const file = payloadFileName(product, policy, kind, isJson ? 'json' : 'txt');
+      const text = isJson ? JSON.stringify(value, null, 2) + '\n' : (value as string);
+      await fs.mkdir(path.dirname(path.join(this.outDir, file)), { recursive: true });
+      await fs.writeFile(path.join(this.outDir, file), text);
+      results.push({ kind, status: isJson ? 'saved' : 'not-json', file, size: Buffer.byteLength(text) });
     }
-    return results;
+    return { payloads: results, dcMissing, note };
   }
 
   async listFiles(): Promise<{ name: string; size: number; modified: string }[]> {
@@ -336,7 +396,7 @@ export class DcService {
     }
     const files = await Promise.all(
       names
-        .filter((n) => /^\d+_(request|response)_payload\.(json|txt)$/.test(n))
+        .filter((n) => SERVED_FILE.test(n))
         .map(async (name) => {
           const st = await fs.stat(path.join(this.outDir, name));
           return { name, size: st.size, modified: st.mtime.toISOString() };
@@ -347,7 +407,7 @@ export class DcService {
 
   filePath(name: string): string {
     // Only serve files we wrote; the regex also blocks path traversal.
-    if (!/^\d+_(request|response)_payload\.(json|txt)$/.test(name)) throw new NotFoundException();
+    if (!SERVED_FILE.test(name)) throw new NotFoundException();
     return path.join(this.outDir, name);
   }
 

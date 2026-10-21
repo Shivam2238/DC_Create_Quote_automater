@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { payloadSql, Product } from './products';
 import { MarkerListener, SshSession } from './ssh-session.service';
 
 const begin = (tag: string) => `__DC_BEGIN_${tag}__`;
@@ -46,7 +47,7 @@ export class RemoteRunnerService {
     return t;
   }
 
-  buildScript(policy: string, wantQuote: boolean, wantPayloads: boolean, pgPassword?: string): string {
+  buildScript(product: Product, policy: string, wantQuote: boolean, wantPayloads: boolean, pgPassword?: string): string {
     const lines = ['set -e', `cd ${shq(this.required('DC_WORK_DIR'))}`];
     if (wantPayloads) lines.push(`export PGPASSWORD=${shq(pgPassword ?? '')}`);
 
@@ -61,13 +62,8 @@ export class RemoteRunnerService {
     }
 
     if (wantPayloads) {
-      // Same semantics as the two manual "latest row" queries; json_build_object
-      // escapes the stored text so it comes back as one safe line.
-      const latest = (col: string) =>
-        `(select ${col} from ${this.apiLogsTable} where policy_number='${policy}' order by created_at desc limit 1)`;
-      const sql =
-        `select json_build_object('request', ${latest('external_request')}, ` +
-        `'response', ${latest('external_response')});`;
+      // json_build_object/json_agg escape the stored text so it comes back as one safe line.
+      const sql = payloadSql(product, this.apiLogsTable, policy);
       lines.push(
         `echo ${begin('PAYLOAD')}`,
         `psql ${shq(this.required('DC_PG_CONN'))} -X -At -v ON_ERROR_STOP=1 -c ${shq(sql)}`,
@@ -81,8 +77,14 @@ export class RemoteRunnerService {
    * Runs the script; a non-zero exit is returned (not thrown) so the caller can keep
    * whatever finished before the failure. Throws only if the session itself fails.
    */
-  async run(script: string, session: SshSession, onMarker?: MarkerListener): Promise<RemoteOutput> {
-    const timeout = (Number(this.config.get('DC_TIMEOUT_SECONDS')) || 180) * 1000;
+  /** Per-job timeout; Motor (Blaze + DuckCreek) can be given more via DC_MOTOR_TIMEOUT_SECONDS. */
+  timeoutMs(product: Product): number {
+    const base = Number(this.config.get('DC_TIMEOUT_SECONDS')) || 180;
+    const motor = Number(this.config.get('DC_MOTOR_TIMEOUT_SECONDS')) || base;
+    return (product === 'motor' ? motor : base) * 1000;
+  }
+
+  async run(script: string, session: SshSession, timeout: number, onMarker?: MarkerListener): Promise<RemoteOutput> {
     const { code, stdout, stderr } = await session.exec(script, timeout, onMarker);
     return { quote: extract(stdout, 'QUOTE'), payload: extract(stdout, 'PAYLOAD'), code, stderr };
   }

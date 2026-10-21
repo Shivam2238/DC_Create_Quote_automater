@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   api,
+  PAYLOAD_LABEL,
+  PRODUCT_INFO,
+  productOf,
   RETRYABLE,
   type Action,
   type BatchDetail,
@@ -8,6 +11,8 @@ import {
   type DbLogs,
   type FailureKind,
   type Job,
+  type PayloadResult,
+  type Product,
   type SessionInfo,
 } from './api'
 import { copy, downloadText, fmtDuration, fmtTime, useNow, type Viewing } from './ui'
@@ -31,14 +36,17 @@ function parsePolicies(text: string): string[] {
   return [...new Set(text.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))]
 }
 
-function previewName(d: Date): string {
+function previewName(product: Product, d: Date): string {
   const date = d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-  return `${date} · ${d.toLocaleTimeString('en-GB', { hour12: false })}`
+  return `${PRODUCT_INFO[product].label} · ${date} · ${d.toLocaleTimeString('en-GB', { hour12: false })}`
 }
 
 // ---------------------------------------------------------------- composer
 
 export function Composer(props: {
+  product: Product
+  /** Switch the whole page to the other product (offered when pasted numbers belong to it). */
+  onSwitchProduct: (p: Product) => void
   pgPassword: string
   setPgPassword: (v: string) => void
   pgConfigured: boolean
@@ -51,17 +59,23 @@ export function Composer(props: {
   const [busy, setBusy] = useState(false)
   const now = useNow(1000)
 
+  const { label, prefix } = PRODUCT_INFO[props.product]
   const policies = useMemo(() => parsePolicies(text), [text])
   const invalid = policies.filter((p) => !/^\d+$/.test(p))
+  // Valid digits but the wrong product (e.g. a Motor number in a Health batch).
+  const wrongProduct = policies.filter((p) => /^\d+$/.test(p) && productOf(p) !== props.product)
+  const otherProduct = wrongProduct.length ? productOf(wrongProduct[0]) : undefined
+  const allOther = !!otherProduct && wrongProduct.length === policies.length && wrongProduct.every((p) => productOf(p) === otherProduct)
   const needsPw = action !== 'quote' && !props.pgConfigured
-  const canStart = !busy && policies.length > 0 && !invalid.length && (!needsPw || !!props.pgPassword)
+  const canStart =
+    !busy && policies.length > 0 && !invalid.length && !wrongProduct.length && (!needsPw || !!props.pgPassword)
 
   async function start() {
     if (!canStart) return
     setBusy(true)
     setError('')
     try {
-      const b = await api.createBatch(policies, action, name.trim(), props.pgPassword)
+      const b = await api.createBatch(props.product, policies, action, name.trim(), props.pgPassword)
       setText('')
       setName('')
       props.onCreated(b)
@@ -73,26 +87,35 @@ export function Composer(props: {
   }
 
   return (
-    <section className="card composer">
-      <h2>New batch</h2>
+    <section className={`card composer product-${props.product}`}>
+      <h2>
+        New {label} batch <span className="muted small">policies start with {prefix}</span>
+      </h2>
       <label className="field">
         <span>Name <span className="muted small">(optional)</span></span>
-        <input value={name} maxLength={100} placeholder={previewName(new Date(now))} onChange={(e) => setName(e.target.value)} />
+        <input value={name} maxLength={100} placeholder={previewName(props.product, new Date(now))} onChange={(e) => setName(e.target.value)} />
       </label>
       <label className="field">
         <span>Policy numbers</span>
         <textarea
           rows={5}
-          placeholder={'1234567890123456789\nOne per line, or separated by commas/spaces'}
+          placeholder={`${prefix}000000000000000\nOne per line, or separated by commas/spaces`}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => (e.ctrlKey || e.metaKey) && e.key === 'Enter' && start()}
         />
-        <small className={invalid.length ? 'err' : 'muted'}>
+        <small className={invalid.length || wrongProduct.length ? 'err' : 'muted'}>
           {invalid.length
             ? `Not a valid policy number: ${invalid.join(', ')}`
-            : `${policies.length} polic${policies.length === 1 ? 'y' : 'ies'} · Ctrl+Enter to start`}
+            : wrongProduct.length
+              ? `Not ${label} (${label} starts with ${prefix}): ${wrongProduct.slice(0, 5).join(', ')}${wrongProduct.length > 5 ? ` +${wrongProduct.length - 5} more` : ''}`
+              : `${policies.length} polic${policies.length === 1 ? 'y' : 'ies'} · Ctrl+Enter to start`}
         </small>
+        {allOther && otherProduct && (
+          <button type="button" className="ghost tiny switch-hint" onClick={() => props.onSwitchProduct(otherProduct)}>
+            These are {PRODUCT_INFO[otherProduct].label} policies → switch to {PRODUCT_INFO[otherProduct].label}
+          </button>
+        )}
       </label>
       <div className="segmented full" role="radiogroup" aria-label="Action">
         {ACTIONS.map((a) => (
@@ -117,7 +140,7 @@ export function Composer(props: {
         />
       )}
       <button className="primary" disabled={!canStart} onClick={start}>
-        {busy ? 'Starting…' : `Start batch${policies.length ? ` (${policies.length})` : ''}`}
+        {busy ? 'Starting…' : `Start ${label} batch${policies.length ? ` (${policies.length})` : ''}`}
       </button>
       {error && <small className="err">{error}</small>}
     </section>
@@ -148,14 +171,19 @@ export function ProgressBar({ b }: { b: BatchSummary }) {
   )
 }
 
-export function BatchList(props: { batches: BatchSummary[]; selectedId?: string; onSelect: (id: string) => void }) {
+export function BatchList(props: {
+  product: Product
+  batches: BatchSummary[]
+  selectedId?: string
+  onSelect: (id: string) => void
+}) {
   return (
     <section className="card batch-list">
       <h2>
-        Batches <span className="muted small">{props.batches.length}</span>
+        {PRODUCT_INFO[props.product].label} batches <span className="muted small">{props.batches.length}</span>
       </h2>
       {props.batches.length === 0 ? (
-        <p className="muted small">No batches yet. Start one above.</p>
+        <p className="muted small">No {PRODUCT_INFO[props.product].label} batches yet. Start one above.</p>
       ) : (
         <ul>
           {props.batches.map((b) => (
@@ -196,59 +224,102 @@ function jobDuration(j: Job, now: number): number | undefined {
   return (j.finishedAt ? Date.parse(j.finishedAt) : now) - Date.parse(j.startedAt)
 }
 
-const REPORT_HEADER = [
-  'policy_number', 'status', 'failure_type', 'failure_reason', 'may_have_created_quote', 'quote_number', 'premium',
-  'premium_matched', 'cohort', 'http_status', 'request_payload', 'response_payload', 'attempts', 'session',
-  'started_at', 'finished_at', 'duration_s',
-]
-// Text columns: digit-only values here (policy numbers) must never be treated as numbers.
-const TEXT_COLUMNS = new Set(['policy_number', 'quote_number'])
-const REPORT_WIDTHS = [22, 11, 13, 60, 12, 20, 10, 10, 8, 8, 34, 34, 8, 8, 24, 24, 10]
-
 type ReportValue = string | number | undefined
 
-/** One row per policy; shared by the CSV and Excel downloads. */
-function reportRows(detail: BatchDetail): ReportValue[][] {
-  return detail.jobs.map((j) => {
-    const q = j.result?.quote
-    const p = (k: string) => j.result?.payloads?.find((x) => x.kind === k)
-    const d = j.startedAt && j.finishedAt ? Number(((Date.parse(j.finishedAt) - Date.parse(j.startedAt)) / 1000).toFixed(1)) : undefined
-    const premium = q?.premium !== undefined && q.premium !== '' && !isNaN(Number(q.premium)) ? Number(q.premium) : q?.premium
-    return [
-      j.policy, j.state, j.failure ? KIND_LABEL[j.failure.kind] : undefined, j.failure?.reason,
-      j.failure ? (j.failure.mayHaveRun ? 'yes' : 'no') : undefined,
-      q?.quoteNumber, premium, q?.isPremiumMatched === undefined ? undefined : q.isPremiumMatched === '1' ? 'yes' : 'no',
-      q?.cohortType, q?.httpStatus, p('request')?.file ?? p('request')?.status, p('response')?.file ?? p('response')?.status,
-      j.attempts, j.session, j.startedAt, j.finishedAt, d,
-    ]
-  })
+interface ReportColumn {
+  header: string
+  width: number
+  /** Always a text cell (digit-only values like policy numbers must never become numbers). */
+  text?: boolean
+  get: (j: Job) => ReportValue
+}
+
+const num = (v?: string): ReportValue => (v !== undefined && v !== '' && !isNaN(Number(v)) ? Number(v) : v)
+const payloadCell = (kind: string) => (j: Job) => {
+  const p = j.result?.payloads?.find((x) => x.kind === kind)
+  return p?.file ?? p?.status
+}
+
+/** Report columns: shared ones plus the product's own quote/payload fields. */
+function reportColumns(product: Product): ReportColumn[] {
+  const head: ReportColumn[] = [
+    { header: 'policy_number', width: 22, text: true, get: (j) => j.policy },
+    { header: 'status', width: 11, get: (j) => j.state },
+    { header: 'failure_type', width: 13, get: (j) => (j.failure ? KIND_LABEL[j.failure.kind] : undefined) },
+    { header: 'failure_reason', width: 60, get: (j) => j.failure?.reason },
+    { header: 'external_error', width: 50, get: (j) => j.result?.externalError ?? j.dbLogs?.summary },
+    { header: 'may_have_created_quote', width: 12, get: (j) => (j.failure ? (j.failure.mayHaveRun ? 'yes' : 'no') : undefined) },
+    { header: 'quote_number', width: 20, text: true, get: (j) => j.result?.quote?.quoteNumber },
+    { header: 'premium', width: 10, get: (j) => num(j.result?.quote?.premium) },
+  ]
+  const health: ReportColumn[] = [
+    {
+      header: 'premium_matched',
+      width: 10,
+      get: (j) => {
+        const m = j.result?.quote?.isPremiumMatched
+        return m === undefined ? undefined : m === '1' ? 'yes' : 'no'
+      },
+    },
+    { header: 'cohort', width: 8, get: (j) => j.result?.quote?.cohortType },
+    { header: 'http_status', width: 8, get: (j) => j.result?.quote?.httpStatus },
+    { header: 'request_payload', width: 34, get: payloadCell('request') },
+    { header: 'response_payload', width: 34, get: payloadCell('response') },
+  ]
+  const motor: ReportColumn[] = [
+    { header: 'pure_premium', width: 10, get: (j) => num(j.result?.quote?.purePremium) },
+    { header: 'taxes', width: 9, get: (j) => num(j.result?.quote?.taxes) },
+    { header: 'discount', width: 9, get: (j) => num(j.result?.quote?.discount) },
+    { header: 'quote_id', width: 10, text: true, get: (j) => j.result?.quote?.quoteId },
+    { header: 'imd_code', width: 14, text: true, get: (j) => j.result?.quote?.imdCode },
+    { header: 'cohort', width: 8, get: (j) => j.result?.quote?.cohortType },
+    { header: 'http_status', width: 8, get: (j) => j.result?.quote?.httpStatus },
+    { header: 'dc_request', width: 32, get: payloadCell('dc_request') },
+    { header: 'dc_response', width: 32, get: payloadCell('dc_response') },
+    { header: 'blaze_request', width: 32, get: payloadCell('blaze_request') },
+    { header: 'blaze_response', width: 32, get: payloadCell('blaze_response') },
+  ]
+  const tail: ReportColumn[] = [
+    { header: 'attempts', width: 8, get: (j) => j.attempts },
+    { header: 'session', width: 8, get: (j) => j.session },
+    { header: 'started_at', width: 24, get: (j) => j.startedAt },
+    { header: 'finished_at', width: 24, get: (j) => j.finishedAt },
+    {
+      header: 'duration_s',
+      width: 10,
+      get: (j) =>
+        j.startedAt && j.finishedAt ? Number(((Date.parse(j.finishedAt) - Date.parse(j.startedAt)) / 1000).toFixed(1)) : undefined,
+    },
+  ]
+  return [...head, ...(product === 'motor' ? motor : health), ...tail]
 }
 
 /** Plain CSV for scripts/tools. (Excel shows 19-digit numbers as 2.8E+18: use the Excel download there.) */
 function csvReport(detail: BatchDetail): string {
+  const cols = reportColumns(detail.summary.product)
   const esc = (v: ReportValue) => {
     const s = v === undefined ? '' : String(v)
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
   }
-  return [REPORT_HEADER, ...reportRows(detail)].map((r) => r.map(esc).join(',')).join('\n') + '\n'
+  const lines = [cols.map((c) => c.header), ...detail.jobs.map((j) => cols.map((c) => esc(c.get(j))))]
+  return lines.map((r) => r.join(',')).join('\n') + '\n'
 }
 
 /** .xlsx with policy/quote numbers stored as text cells, so they show exactly. Library is loaded on demand. */
 async function downloadExcelReport(detail: BatchDetail, fileName: string) {
   const { default: writeExcelFile } = await import('write-excel-file/browser')
-  const header = REPORT_HEADER.map((h) => ({ value: h, type: String, fontWeight: 'bold' as const }))
-  const rows = reportRows(detail).map((r) =>
-    r.map((v, i) =>
-      v === undefined
-        ? null
-        : TEXT_COLUMNS.has(REPORT_HEADER[i]) || typeof v === 'string'
-          ? { value: String(v), type: String }
-          : { value: v, type: Number },
-    ),
+  const cols = reportColumns(detail.summary.product)
+  const header = cols.map((c) => ({ value: c.header, type: String, fontWeight: 'bold' as const }))
+  const rows = detail.jobs.map((j) =>
+    cols.map((c) => {
+      const v = c.get(j)
+      if (v === undefined) return null
+      return c.text || typeof v === 'string' ? { value: String(v), type: String } : { value: v, type: Number }
+    }),
   )
   await writeExcelFile([header, ...rows], {
-    sheet: 'Report',
-    columns: REPORT_WIDTHS.map((width) => ({ width })),
+    sheet: `${PRODUCT_INFO[detail.summary.product].label} report`,
+    columns: cols.map((c) => ({ width: c.width })),
     stickyRowsCount: 1,
   }).toFile(fileName)
 }
@@ -530,8 +601,14 @@ export function BatchDetailView(props: {
               <th>Policy</th>
               <th>Result</th>
               <th>Quote number</th>
-              <th>Premium</th>
-              <th title="Premium matched · cohort">Match · Cohort</th>
+              {b.product === 'motor' ? (
+                <th title="Premium = PurePremium + TaxesSurcharges">Premium</th>
+              ) : (
+                <>
+                  <th>Premium</th>
+                  <th title="Premium matched · cohort">Match · Cohort</th>
+                </>
+              )}
               <th>Payloads</th>
               <th>Time</th>
               <th aria-label="Actions" />
@@ -540,7 +617,7 @@ export function BatchDetailView(props: {
           <tbody>
             {shown.length === 0 ? (
               <tr>
-                <td colSpan={8} className="muted">No policies in this view.</td>
+                <td colSpan={b.product === 'motor' ? 7 : 8} className="muted">No policies in this view.</td>
               </tr>
             ) : (
               shown.map((j) => (
@@ -622,41 +699,48 @@ function JobRow(props: {
               </button>
             </span>
           ) : q ? (
-            <button className="link" onClick={() => props.onView({ title: `${j.policy} · create-quote response`, content: q.raw })}>
+            <button
+              className="link"
+              onClick={() =>
+                props.onView(
+                  q.rawFile
+                    ? { title: `${j.policy} · create-quote response`, file: q.rawFile }
+                    : { title: `${j.policy} · create-quote response`, content: q.raw },
+                )
+              }
+            >
               View response
             </button>
           ) : (
             <span className="muted">—</span>
           )}
         </td>
-        <td className="num">{q?.premium ?? '—'}</td>
-        <td>
-          {q?.isPremiumMatched === undefined ? (
-            <span className="muted">—</span>
-          ) : (
-            <>
-              <span className={q.isPremiumMatched === '1' ? 'ok-text' : 'err'}>{q.isPremiumMatched === '1' ? 'Yes' : 'No'}</span>
-              {q.cohortType && <span className="muted"> · {q.cohortType}</span>}
-            </>
-          )}
-        </td>
-        <td>
-          {j.result?.payloads?.length && j.result.payloads.every((p) => !p.file) ? (
-            <span className="muted small">No row</span>
-          ) : j.result?.payloads?.length ? (
-            j.result.payloads.map((p) =>
-              p.file ? (
-                <button key={p.kind} className="link" onClick={() => props.onView({ title: `${j.policy} · ${p.kind}`, file: p.file })}>
-                  {p.kind === 'request' ? 'Request' : 'Response'}
-                  {p.status === 'not-json' && ' (raw)'}
-                </button>
+        {j.product === 'motor' ? (
+          <td className="num">
+            {q?.premium ?? '—'}
+            {q?.purePremium !== undefined && (
+              <div className="muted small" title="PurePremium + TaxesSurcharges">
+                {q.purePremium} + {q.taxes ?? '—'}
+              </div>
+            )}
+          </td>
+        ) : (
+          <>
+            <td className="num">{q?.premium ?? '—'}</td>
+            <td>
+              {q?.isPremiumMatched === undefined ? (
+                <span className="muted">—</span>
               ) : (
-                <span key={p.kind} className="muted small">{p.kind === 'request' ? 'Req' : 'Resp'}: null </span>
-              ),
-            )
-          ) : (
-            <span className="muted">—</span>
-          )}
+                <>
+                  <span className={q.isPremiumMatched === '1' ? 'ok-text' : 'err'}>{q.isPremiumMatched === '1' ? 'Yes' : 'No'}</span>
+                  {q.cohortType && <span className="muted"> · {q.cohortType}</span>}
+                </>
+              )}
+            </td>
+          </>
+        )}
+        <td className="payload-cell">
+          <PayloadLinks policy={j.policy} payloads={j.result?.payloads} onView={props.onView} />
         </td>
         <td className="num muted">{d === undefined ? '—' : fmtDuration(d)}</td>
         <td className="row-buttons">
@@ -703,11 +787,13 @@ function JobRow(props: {
       </tr>
       {(j.state === 'failed' || (j.state === 'cancelled' && j.failure)) && j.failure && (
         <tr className="failure-row">
-          <td colSpan={8}>
+          <td colSpan={j.product === 'motor' ? 7 : 8}>
             <div className={`failure ${j.failure.kind === 'stopped' ? 'stopped' : ''}`}>
               <span>{j.failure.reason}</span>
               {RETRYABLE.includes(j.failure.kind) && !(j.failure.mayHaveRun && !q?.success) && (
-                <span className="chip info">Likely a broken connection: retry</span>
+                <span className="chip info">
+                  {j.failure.kind === 'connection' ? 'Likely a broken connection: retry' : 'Temporary service error: retry may work'}
+                </span>
               )}
               {j.failure.mayHaveRun && !q?.success && (RETRYABLE.includes(j.failure.kind) || j.failure.kind === 'stopped') && (
                 <span className="chip warn">May have created a quote: check before retrying</span>
@@ -716,7 +802,7 @@ function JobRow(props: {
             </div>
             {j.result?.externalError && (
               <div className="external">
-                <span className="external-label">DuckCreek response:</span> {j.result.externalError}
+                <span className="external-label">{externalSource(j.result.payloads)}:</span> {j.result.externalError}
               </div>
             )}
             {j.dbLogs && <DbLogsLine policy={j.policy} logs={j.dbLogs} onView={props.onView} />}
@@ -738,7 +824,7 @@ function JobRow(props: {
       )}
       {j.state === 'succeeded' && j.history.length > 0 && (
         <tr className="failure-row">
-          <td colSpan={8}>
+          <td colSpan={j.product === 'motor' ? 7 : 8}>
             <details className="history">
               <summary className="small muted">
                 Succeeded on try {j.attempts} · {j.history.length} earlier failure{j.history.length === 1 ? '' : 's'}
@@ -768,14 +854,57 @@ function DbLogsLine({ policy, logs, onView }: { policy: string; logs: DbLogs; on
     <div className={`external ${logs.state === 'error' ? 'err' : ''}`}>
       <span className="external-label">🗄 DB response{when}:</span>{' '}
       {logs.state === 'error' ? logs.error : (logs.summary ?? 'no error text found in external_response, open it to check')}
-      {logs.payloads?.map(
-        (p) =>
-          p.file && (
-            <button key={p.kind} className="link small-link" onClick={() => onView({ title: `${policy} · DB ${p.kind}`, file: p.file })}>
-              {p.kind === 'request' ? 'Request' : 'Response'}
-            </button>
-          ),
-      )}
+      {' '}
+      <PayloadLinks policy={policy} payloads={logs.payloads} onView={onView} small />
     </div>
   )
+}
+
+/**
+ * Links to saved api_logs payloads. Health: Request · Response.
+ * Motor: grouped as "DC req resp · Blaze req resp" (two calls per attempt).
+ */
+function PayloadLinks(props: { policy: string; payloads?: PayloadResult[]; onView: (v: Viewing) => void; small?: boolean }) {
+  const { policy, payloads, onView } = props
+  if (!payloads?.length) return <span className="muted">—</span>
+  if (payloads.every((p) => !p.file)) return <span className="muted small">No row</span>
+  const link = (p: PayloadResult, text: string) =>
+    p.file ? (
+      <button
+        key={p.kind}
+        className={`link ${props.small ? 'small-link' : ''}`}
+        onClick={() => onView({ title: `${policy} · ${PAYLOAD_LABEL[p.kind] ?? p.kind}`, file: p.file })}
+        title={p.status === 'not-json' ? 'Stored as plain text (not JSON)' : undefined}
+      >
+        {text}
+        {p.status === 'not-json' && ' (raw)'}
+      </button>
+    ) : (
+      <span key={p.kind} className="muted small" title="NULL in api_logs">
+        {text}: null{' '}
+      </span>
+    )
+  const byKind = (k: string) => payloads.find((p) => p.kind === k)
+  if (!byKind('dc_request') && !byKind('blaze_request')) {
+    return <>{payloads.map((p) => link(p, PAYLOAD_LABEL[p.kind] ?? p.kind))}</>
+  }
+  const group = (name: string, req?: PayloadResult, resp?: PayloadResult) => (
+    <span className="payload-group">
+      <span className="muted small">{name}</span> {req && link(req, 'req')} {resp && link(resp, 'resp')}
+    </span>
+  )
+  return (
+    <>
+      {group('DC', byKind('dc_request'), byKind('dc_response'))}
+      {group('Blaze', byKind('blaze_request'), byKind('blaze_response'))}
+    </>
+  )
+}
+
+/** Which saved response the error text came from (same priority as the backend's summary). */
+function externalSource(payloads?: PayloadResult[]): string {
+  const has = (k: string) => payloads?.some((p) => p.kind === k && p.file)
+  if (has('response') || has('dc_response')) return 'DuckCreek response'
+  if (has('blaze_response')) return 'Blaze response'
+  return 'External response'
 }

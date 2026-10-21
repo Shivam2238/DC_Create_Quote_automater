@@ -43,9 +43,29 @@ npm run build && npm start     # http://localhost:3000
 | `DC_OUT_DIR` | Where payload files are saved (default `./payloads`) |
 | `DC_SESSIONS` | Parallel SSH sessions / workers (default 4, max 8) |
 | `DC_TIMEOUT_SECONDS` | Per-job timeout (default 180); when it's hit, the session is restarted |
+| `DC_MOTOR_TIMEOUT_SECONDS` | Optional longer per-job timeout for Motor (Blaze + DuckCreek) |
 | `DC_CONNECT_TIMEOUT_SECONDS` | Time allowed to open the SSH session (default 90) |
 | `DC_WORK_DIR`, `DC_CREATE_QUOTE_URL`, `DC_PG_CONN`, `DC_API_LOGS_TABLE` | **Required.** VM directory, wrapper URL, psql connection string, api_logs table (see `.env.example`) |
 | `DC_LOCAL=true` | Server is running on the VM itself, so SSH is skipped |
+
+## Health and Motor
+
+The header switch (**Health 2856… / Motor 2302…**) picks the product. The composer, batch list and report only show
+that product. SSH sessions, settings and the activity log are shared, because both use the same VM and wrapper.
+Batches from before Motor support load as Health.
+
+| | Health (`2856…`) | Motor (`2302…`) |
+| --- | --- | --- |
+| Wrapper call | `wrapper/create-quote` (same endpoint, routed by prefix) | same |
+| Wrapper response | short summary: `quote_number`, `premium`, `is_premium_matched`, `cohort_type` | DuckCreek's full `session`: `policy.QuoteNumber`, `policy.line.Premium` (= `PurePremium` + `TaxesSurcharges`) |
+| `api_logs` rows per attempt | 1 (DuckCreek) | 2 (**Blaze rating**, then **DuckCreek**), told apart by `api_endpoint` |
+| Payload files | `payloads/<policy>_{request,response}_payload.json` | `payloads/motor/<policy>_{dc,blaze}_{request,response}.json` |
+| Report extras | premium_matched, cohort | pure_premium, taxes, discount, quote_id, imd_code, the 4 payload files |
+
+For Motor, the newest `api_logs` row decides the attempt. If it's a DuckCreek row, it's paired with the Blaze row
+logged just before it. If it's a Blaze row, DuckCreek wasn't reached in that attempt. Wrapper responses over 20 KB
+(Motor's full session) are saved as `…_quote_response.json` instead of being stored in the batch. A failure at the
+Blaze step is never flagged "may have created a quote", because DuckCreek is only called after Blaze.
 
 ## Batches
 
@@ -68,7 +88,7 @@ quote and only the payload step failed, the retry only re-fetches the payloads (
 
 - `GET /api/status` – gcloud auth state, VM config
 - `GET /api/state?since=<seq>&batch=<id>` – sessions, batch summaries, the selected batch's jobs, and new log events (the UI polls this)
-- `POST /api/batches` `{ policies, action: "quote" | "payloads" | "all", name?, pgPassword? }` – start a batch
+- `POST /api/batches` `{ product: "health" | "motor", policies, action: "quote" | "payloads" | "all", name?, pgPassword? }` – start a batch
 - `GET /api/batches/:id`, `PATCH /api/batches/:id` `{ name }`, `DELETE /api/batches/:id`
 - `POST /api/batches/:id/retry` `{ jobIds?, pgPassword? }` – without `jobIds`, retries every connection/server failure
 - `POST /api/batches/:id/cancel` – cancel the batch's queued policies

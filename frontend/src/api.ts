@@ -1,14 +1,45 @@
 export type Action = 'quote' | 'payloads' | 'all'
-export type PayloadKind = 'request' | 'response'
+
+/** Health (2856…) and Motor (2302…) run separately: each batch belongs to one product. */
+export type Product = 'health' | 'motor'
+export const PRODUCTS: Product[] = ['health', 'motor']
+export const PRODUCT_INFO: Record<Product, { label: string; prefix: string }> = {
+  health: { label: 'Health', prefix: '2856' },
+  motor: { label: 'Motor', prefix: '2302' },
+}
+export const productOf = (policy: string): Product | undefined =>
+  PRODUCTS.find((p) => policy.startsWith(PRODUCT_INFO[p].prefix))
+
+/** Health: request/response. Motor: dc_request/dc_response/blaze_request/blaze_response. */
+export type PayloadKind = string
+export const PAYLOAD_LABEL: Record<string, string> = {
+  request: 'Request',
+  response: 'Response',
+  dc_request: 'DC req',
+  dc_response: 'DC resp',
+  blaze_request: 'Blaze req',
+  blaze_response: 'Blaze resp',
+}
 
 export interface QuoteResult {
   success: boolean
   quoteNumber?: string
+  /** Gross premium (Motor: PurePremium + TaxesSurcharges). */
   premium?: string
-  isPremiumMatched?: string
+  purePremium?: string
+  taxes?: string
+  discount?: string
+  quoteId?: string
+  imdCode?: string
   cohortType?: string
+  quoteGeneratedDate?: string
+  /** Health only: the wrapper's own premium comparison. */
+  isPremiumMatched?: string
   httpStatus?: number
-  raw: unknown
+  /** Wrapper response, inline when small… */
+  raw?: unknown
+  /** …or saved to this file (Motor's full DuckCreek session). */
+  rawFile?: string
 }
 
 export interface PayloadResult {
@@ -64,6 +95,7 @@ export interface Attempt {
 export interface Job {
   id: string
   batchId: string
+  product: Product
   policy: string
   action: Action
   runAction: Action
@@ -94,6 +126,7 @@ export type BatchStatus = 'running' | 'succeeded' | 'failed' | 'cancelled'
 export interface BatchSummary {
   id: string
   name: string
+  product: Product
   action: Action
   createdAt: string
   finishedAt?: string
@@ -177,8 +210,8 @@ export const api = {
   status: () => fetch('/api/status').then((r) => json<Status>(r)),
   state: (since: number, batch?: string) =>
     fetch(`/api/state?since=${since}${batch ? `&batch=${encodeURIComponent(batch)}` : ''}`).then((r) => json<AppState>(r)),
-  createBatch: (policies: string[], action: Action, name?: string, pgPassword?: string) =>
-    send('POST', '/api/batches', { policies, action, name: name || undefined, pgPassword: pgPassword || undefined }).then((r) =>
+  createBatch: (product: Product, policies: string[], action: Action, name?: string, pgPassword?: string) =>
+    send('POST', '/api/batches', { product, policies, action, name: name || undefined, pgPassword: pgPassword || undefined }).then((r) =>
       json<BatchDetail>(r),
     ),
   rename: (id: string, name: string) => send('PATCH', `/api/batches/${id}`, { name }).then((r) => json<BatchSummary>(r)),

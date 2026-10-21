@@ -274,3 +274,23 @@ tr.has-detail td { border-bottom: none; }
 .external-label { font-weight: 600; color: var(--warn); }
 .small-link { font-size: 12px; padding: 0 0 0 8px; }
 .inline-pw { width: 170px; padding: 6px 8px; }
+.detail td.payload-cell { white-space: normal; min-width: 120px; }
+.payload-group { display: inline-block; margin-right: 8px; white-space: nowrap; }
+.payload-group .link { padding-right: 4px; }
+.switch-hint { justify-self: start; margin-top: 2px; }
+
+/* ---------- Health / Motor ---------- */
+:root { --health: #0f8a6b; --health-bg: #e3f5ef; --motor: #b35c00; --motor-bg: #fdefe0; }
+@media (prefers-color-scheme: dark) { :root { --health: #4fd1a5; --health-bg: #133229; --motor: #f0a35a; --motor-bg: #3a2814; } }
+
+.product-switch { display: inline-flex; gap: 6px; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.product-tab { display: inline-flex; align-items: baseline; gap: 6px; background: transparent; color: var(--muted); border: 1px solid transparent; padding: 6px 14px; border-radius: 7px; }
+.product-tab .product-name { font-weight: 700; font-size: 15px; }
+.product-tab .product-prefix { font-size: 11px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.product-tab:hover { color: var(--text); }
+.product-tab.health.on { background: var(--health-bg); color: var(--health); border-color: var(--health); }
+.product-tab.motor.on { background: var(--motor-bg); color: var(--motor); border-color: var(--motor); }
+.product-running { font-size: 11px; min-width: 18px; text-align: center; border-radius: 999px; background: var(--accent); color: var(--accent-text); padding: 0 5px; }
+
+.composer.product-health { border-top: 3px solid var(--health); }
+.composer.product-motor { border-top: 3px solid var(--motor); }

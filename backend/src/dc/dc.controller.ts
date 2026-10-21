@@ -3,10 +3,12 @@ import type { Response } from 'express';
 import { ActivityService } from './activity.service';
 import { Action, DcService } from './dc.service';
 import { JobQueueService } from './job-queue.service';
+import { Product } from './products';
 import { MAX_AUTO_RETRIES, MAX_SESSIONS, SettingsService } from './settings.service';
 import { SshPoolService } from './ssh-pool.service';
 
 class CreateBatchDto {
+  product: Product;
   policies: string[];
   action: Action;
   name?: string;
@@ -61,7 +63,7 @@ export class DcController {
 
   @Post('batches')
   createBatch(@Body() body: CreateBatchDto) {
-    return this.queue.create(body.policies, body.action, body.name, body.pgPassword);
+    return this.queue.create(body.product ?? 'health', body.policies, body.action, body.name, body.pgPassword);
   }
 
   @Get('batches/:id')
